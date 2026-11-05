@@ -2906,8 +2906,16 @@ public class MainActivity extends Activity
                 && GoldKeyboard.matches(event.getDevice());
     }
 
+    private static boolean isVolumeKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_VOLUME_UP
+                || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+                || keyCode == KeyEvent.KEYCODE_VOLUME_MUTE;
+    }
+
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (isVolumeKey(keyCode))
+            return super.onKeyDown(keyCode, event);
         if (handleSourceAwareKey(event))
             return true;
         // Before the repeat swallow: each repeat must become one more tap, so
@@ -2944,6 +2952,8 @@ public class MainActivity extends Activity
     // Called from KeyInterceptor (accessibility service) to handle keys that
     // the normal onKeyDown/onKeyUp might miss (e.g. Fn combos).
     public boolean handleAccessibilityKey(KeyEvent event) {
+        if (isVolumeKey(event.getKeyCode()))
+            return false;
         // The same decision boundary as the Activity paths: with interception on
         // this is the only ingress, and the two must not diverge.
         if (handleSourceAwareKey(event))
@@ -3041,6 +3051,8 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (isVolumeKey(keyCode))
+            return super.onKeyUp(keyCode, event);
         if (handleSourceAwareKey(event))
             return true;
         if (handleImeDelTap(event))

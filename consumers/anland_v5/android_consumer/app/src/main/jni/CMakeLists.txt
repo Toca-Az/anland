@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.18)
 project(anland_consumer C CXX)
 
-set(LIBDISPLAY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../..)
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.." ABSOLUTE)
+if(NOT EXISTS "${REPO_ROOT}/libdisplay_consumer")
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
+endif()
+set(LIBDISPLAY_DIR ${REPO_ROOT})
 
 # ---------- Tracy profiler (https://github.com/wolfpld/tracy) ----------
 # Client is fetched at configure time and linked in as a static C++ library;
