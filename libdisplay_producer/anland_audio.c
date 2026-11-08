@@ -42,6 +42,8 @@ struct anland_audio {
     struct spa_hook        capture_listener;
     struct pw_stream      *source;    /* virtual Audio/Source <- socket (capture) */
     struct spa_hook        source_listener;
+    bool                   mic_streaming; /* a Linux app is consuming the mic node */
+    bool                   mic_recording; /* we've told the consumer to START mic */
 
     /* Negotiated formats (the consumer owns the hardware and dictates these via
      * AUDIO_MSG_FORMAT). Defaults stand until the consumer's formats arrive. */
@@ -116,6 +118,7 @@ static void detach_audio_fd_locked(struct anland_audio *a)
 {
     struct spa_source *io = a->io;
     a->io = NULL;
+    a->mic_recording = false;
     a->audio_fd = -1;
     ring_reset(a);
     if (io)
@@ -179,8 +182,45 @@ static const struct pw_stream_events capture_events = {
     .process = on_capture_process,
 };
 
+/* Reconcile the "should the consumer capture mic?" state with what we've told it.
+ * Recording is wanted when an app is consuming the mic node AND we have a live
+ * audio socket. Runs on the PipeWire loop thread, or with pw_thread_loop_lock held. */
+static void update_mic_recording(struct anland_audio *a)
+{
+    const bool want = a->mic_streaming && a->audio_fd >= 0;
+    if (want == a->mic_recording)
+        return;
+    if (want) {
+        struct audio_msg h = { .type = AUDIO_MSG_MIC_START, .size = 0 };
+        send(a->audio_fd, &h, sizeof(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+        fprintf(stderr, "anland-audio: START_RECORD mic\n");
+    } else if (a->audio_fd >= 0) {
+        struct audio_msg h = { .type = AUDIO_MSG_MIC_STOP, .size = 0 };
+        send(a->audio_fd, &h, sizeof(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+        fprintf(stderr, "anland-audio: STOP_RECORD mic\n");
+    }
+    a->mic_recording = want;
+    if (!want)
+        ring_reset(a);
+}
+
+static void on_source_state_changed(void *data, enum pw_stream_state old,
+                                    enum pw_stream_state state, const char *error)
+{
+    struct anland_audio *a = data;
+    (void)error;
+    fprintf(stderr, "anland-audio: mic source state %s -> %s\n",
+            pw_stream_state_as_string(old), pw_stream_state_as_string(state));
+    const bool streaming = (state == PW_STREAM_STATE_STREAMING);
+    if (streaming == a->mic_streaming)
+        return;
+    a->mic_streaming = streaming;
+    update_mic_recording(a);
+}
+
 static const struct pw_stream_events source_events = {
     PW_VERSION_STREAM_EVENTS,
+    .state_changed = on_source_state_changed,
     .process = on_source_process,
 };
 
@@ -384,6 +424,14 @@ static void teardown_pw(struct anland_audio *a)
         pw_stream_destroy(a->source);
         a->source = NULL;
     }
+    a->mic_streaming = false;
+    if (a->mic_recording && a->audio_fd >= 0) {
+        struct audio_msg h = { .type = AUDIO_MSG_MIC_STOP, .size = 0 };
+        send(a->audio_fd, &h, sizeof(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+        fprintf(stderr, "anland-audio: teardown STOP_RECORD mic\n");
+    }
+    a->mic_recording = false;
+
     if (a->core) {
         spa_hook_remove(&a->core_listener);
         pw_core_disconnect(a->core);
@@ -480,6 +528,7 @@ void anland_audio_set_fd(int audio_fd)
                                    SPA_IO_IN, true, on_audio_readable, a);
             if (a->io) {
                 a->audio_fd = owned_fd;
+                update_mic_recording(a);
             } else {
                 close(owned_fd);
             }

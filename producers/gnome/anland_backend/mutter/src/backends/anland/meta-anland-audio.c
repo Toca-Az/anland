@@ -48,6 +48,8 @@ struct _MetaAnlandAudio
   struct spa_hook capture_listener;
   struct pw_stream *source;
   struct spa_hook source_listener;
+  bool mic_streaming;
+  bool mic_recording;
 
   uint32_t play_rate;
   uint32_t play_channels;
@@ -218,8 +220,47 @@ static const struct pw_stream_events capture_events = {
   .process = on_capture_process,
 };
 
+static void
+update_mic_recording (MetaAnlandAudio *audio)
+{
+  const bool want = audio->mic_streaming && audio->audio_fd >= 0;
+  if (want == audio->mic_recording)
+    return;
+  if (want)
+    {
+      struct audio_msg h = { .type = AUDIO_MSG_MIC_START, .size = 0 };
+      send (audio->audio_fd, &h, sizeof (h), MSG_DONTWAIT | MSG_NOSIGNAL);
+      g_message ("anland-audio: START_RECORD mic");
+    }
+  else if (audio->audio_fd >= 0)
+    {
+      struct audio_msg h = { .type = AUDIO_MSG_MIC_STOP, .size = 0 };
+      send (audio->audio_fd, &h, sizeof (h), MSG_DONTWAIT | MSG_NOSIGNAL);
+      g_message ("anland-audio: STOP_RECORD mic");
+    }
+  audio->mic_recording = want;
+  if (!want)
+    ring_reset (audio);
+}
+
+static void
+on_source_state_changed (void *data, enum pw_stream_state old,
+                         enum pw_stream_state state, const char *error)
+{
+  MetaAnlandAudio *audio = data;
+  (void) error;
+  g_message ("anland-audio: mic source state %s -> %s",
+             pw_stream_state_as_string (old), pw_stream_state_as_string (state));
+  const bool streaming = (state == PW_STREAM_STATE_STREAMING);
+  if (streaming == audio->mic_streaming)
+    return;
+  audio->mic_streaming = streaming;
+  update_mic_recording (audio);
+}
+
 static const struct pw_stream_events source_events = {
   PW_VERSION_STREAM_EVENTS,
+  .state_changed = on_source_state_changed,
   .process = on_source_process,
 };
 
@@ -556,6 +597,7 @@ meta_anland_audio_set_fd (MetaAnlandAudio *audio,
     close (audio->audio_fd);
   audio->audio_fd = owned_fd;
   ring_reset (audio);
+  audio->mic_recording = false;
 
   if (owned_fd >= 0)
     {
@@ -565,6 +607,10 @@ meta_anland_audio_set_fd (MetaAnlandAudio *audio,
         {
           close (audio->audio_fd);
           audio->audio_fd = -1;
+        }
+      else
+        {
+          update_mic_recording (audio);
         }
     }
 

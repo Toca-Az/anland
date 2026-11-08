@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.18)
 project(anland_consumer C CXX)
 
-get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.." ABSOLUTE)
-if(NOT EXISTS "${REPO_ROOT}/libdisplay_consumer")
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../.." ABSOLUTE)
+if(NOT EXISTS "${REPO_ROOT}/libdisplay_consumer/display_consumer.c")
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.." ABSOLUTE)
+endif()
+if(NOT EXISTS "${REPO_ROOT}/libdisplay_consumer/display_consumer.c")
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
 endif()
 set(LIBDISPLAY_DIR ${REPO_ROOT})
