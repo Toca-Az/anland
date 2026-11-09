@@ -658,6 +658,9 @@ static void *cap_thread_func(void *arg)
             if (started && b->rec) {
                 LOGI("mic auto-sleep: AAudioStream_requestStop");
                 AAudioStream_requestStop(b->rec);
+                aaudio_stream_state_t next_state = AAUDIO_STREAM_STATE_UNKNOWN;
+                AAudioStream_waitForStateChange(b->rec, AAUDIO_STREAM_STATE_STOPPING,
+                                               &next_state, 100 * 1000 * 1000L);
                 started = false;
             }
             struct timespec ts;
@@ -823,11 +826,12 @@ void audio_stop(audio_bridge *b)
 
 void audio_set_ctx(audio_bridge *b, display_ctx *ctx)
 {
-    if (b)
-        pthread_mutex_lock(&b->mic_lock);
-        b->ctx = ctx;
-        pthread_cond_signal(&b->mic_cond);
-        pthread_mutex_unlock(&b->mic_lock);
+    if (!b)
+        return;
+    pthread_mutex_lock(&b->mic_lock);
+    b->ctx = ctx;
+    pthread_cond_signal(&b->mic_cond);
+    pthread_mutex_unlock(&b->mic_lock);
 }
 
 void audio_set_mic_enabled(audio_bridge *b, int enabled)
