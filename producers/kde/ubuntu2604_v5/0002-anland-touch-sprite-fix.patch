@@ -1,0 +1,119 @@
+--- /root/clean_check/anlandx/xserver/hw/xwayland/xwayland-window.c	2026-04-14 21:09:04.000000000 +0800
++++ /root/build_xwayland/anlandx/xserver/hw/xwayland/xwayland-window.c	2026-11-13 10:17:28.033988589 +0800
+@@ -301,6 +301,9 @@
+     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+     PixmapPtr window_pixmap;
+ 
++    if (!xwl_window || !xwl_window->surface_window)
++        return;
++
+     if (xwl_window &&
+         xwl_window->surface_window_damage &&
+         RegionNotEmpty(pRegion)) {
+--- /root/clean_check/anlandx/xserver/hw/xwayland/xwayland-input.c	2026-04-14 21:09:04.000000000 +0800
++++ /root/build_xwayland/anlandx/xserver/hw/xwayland/xwayland-input.c	2026-11-13 10:17:28.033988589 +0800
+@@ -1438,6 +1438,19 @@
+     double dx, dy, x, y;
+     ValuatorMask mask;
+ 
++    if (xwl_seat && xwl_seat->touch) {
++        if (!xwl_seat->touch->spriteInfo->sprite || !xwl_seat->touch->master) {
++            DeviceIntPtr master = inputInfo.pointer;
++            if (master) {
++                AttachDevice(serverClient, xwl_seat->touch, master);
++                if (master->spriteInfo && master->spriteInfo->sprite) {
++                    xwl_seat->touch->spriteInfo->sprite = master->spriteInfo->sprite;
++                    xwl_seat->touch->spriteInfo->paired = master;
++                }
++            }
++        }
++    }
++
+     dx = xwl_touch->window->toplevel->drawable.x;
+     dy = xwl_touch->window->toplevel->drawable.y;
+ 
+@@ -1473,6 +1486,10 @@
+     }
+ 
+     xwl_touch->window = wl_surface_get_user_data(surface);
++    if (!xwl_touch->window) {
++        free(xwl_touch);
++        return;
++    }
+     xwl_touch->id = id;
+     xwl_touch->x = wl_fixed_to_int(sx_w);
+     xwl_touch->y = wl_fixed_to_int(sy_w);
+--- /root/clean_check/anlandx/xserver/dix/getevents.c	2026-04-14 21:09:04.000000000 +0800
++++ /root/build_xwayland/anlandx/xserver/dix/getevents.c	2026-11-13 09:40:54.429989426 +0800
+@@ -2041,13 +2041,23 @@
+         clipAbsolute(dev, &mask);
+     }
+     else {
+-        screenx = dev->spriteInfo->sprite->hotPhys.x;
+-        screeny = dev->spriteInfo->sprite->hotPhys.y;
++        if (dev->spriteInfo->sprite) {
++            screenx = dev->spriteInfo->sprite->hotPhys.x;
++            screeny = dev->spriteInfo->sprite->hotPhys.y;
++        } else if (inputInfo.pointer && inputInfo.pointer->spriteInfo && inputInfo.pointer->spriteInfo->sprite) {
++            screenx = inputInfo.pointer->spriteInfo->sprite->hotPhys.x;
++            screeny = inputInfo.pointer->spriteInfo->sprite->hotPhys.y;
++        }
+     }
+     if (need_rawevent)
+         set_raw_valuators(raw, &mask, FALSE, raw->valuators.data);
+ 
+-    scr = dev->spriteInfo->sprite->hotPhys.pScreen;
++    if (dev->spriteInfo->sprite)
++        scr = dev->spriteInfo->sprite->hotPhys.pScreen;
++    else if (inputInfo.pointer && inputInfo.pointer->spriteInfo && inputInfo.pointer->spriteInfo->sprite)
++        scr = inputInfo.pointer->spriteInfo->sprite->hotPhys.pScreen;
++    else
++        scr = screenInfo.screens[0];
+ 
+     /* Indirect device touch coordinates are not used for cursor positioning.
+      * They are merely informational, and are provided in device coordinates.
+@@ -2100,7 +2110,13 @@
+ GetDixTouchEnd(InternalEvent *ievent, DeviceIntPtr dev, TouchPointInfoPtr ti,
+                uint32_t flags)
+ {
+-    ScreenPtr scr = dev->spriteInfo->sprite->hotPhys.pScreen;
++    ScreenPtr scr;
++    if (dev->spriteInfo->sprite)
++        scr = dev->spriteInfo->sprite->hotPhys.pScreen;
++    else if (inputInfo.pointer && inputInfo.pointer->spriteInfo && inputInfo.pointer->spriteInfo->sprite)
++        scr = inputInfo.pointer->spriteInfo->sprite->hotPhys.pScreen;
++    else
++        scr = screenInfo.screens[0];
+     DeviceEvent *event = &ievent->device_event;
+     CARD32 ms = GetTimeInMillis();
+ 
+@@ -2167,14 +2183,26 @@
+                  double delta_unaccel_x, double delta_unaccel_y,
+                  double scale, double delta_angle)
+ {
+-    ScreenPtr scr = dev->spriteInfo->sprite->hotPhys.pScreen;
++    ScreenPtr scr;
+     GestureEvent *event = &ievent->gesture_event;
+     double screenx = 0.0, screeny = 0.0;        /* desktop coordinate system */
+ 
++    if (dev->spriteInfo->sprite)
++        scr = dev->spriteInfo->sprite->hotPhys.pScreen;
++    else if (inputInfo.pointer && inputInfo.pointer->spriteInfo && inputInfo.pointer->spriteInfo->sprite)
++        scr = inputInfo.pointer->spriteInfo->sprite->hotPhys.pScreen;
++    else
++        scr = screenInfo.screens[0];
++
+     init_gesture_event(event, dev, ms);
+ 
+-    screenx = dev->spriteInfo->sprite->hotPhys.x;
+-    screeny = dev->spriteInfo->sprite->hotPhys.y;
++    if (dev->spriteInfo->sprite) {
++        screenx = dev->spriteInfo->sprite->hotPhys.x;
++        screeny = dev->spriteInfo->sprite->hotPhys.y;
++    } else if (inputInfo.pointer && inputInfo.pointer->spriteInfo && inputInfo.pointer->spriteInfo->sprite) {
++        screenx = inputInfo.pointer->spriteInfo->sprite->hotPhys.x;
++        screeny = inputInfo.pointer->spriteInfo->sprite->hotPhys.y;
++    }
+ 
+     event->type = type;
+     event->root = scr->root->drawable.id;
