@@ -45,6 +45,7 @@
 struct audio_bridge {
     atomic_bool running;
     atomic_bool mic_enabled;
+    atomic_bool mic_active;
 
     /* The live connection. Set by audio_set_ctx() from the render thread, read by
      * the audio threads -- same lightweight convention as the event thread's
@@ -78,6 +79,8 @@ struct audio_bridge {
      * without reconnecting the display pipeline.
      */
     pthread_mutex_t play_lock;
+    pthread_mutex_t mic_lock;
+    pthread_cond_t  mic_cond;
     uint8_t *play_ring;
     size_t play_ring_size;
     size_t play_ring_head;
@@ -578,6 +581,21 @@ static void *play_thread_func(void *arg)
 
         struct audio_msg h;
         memcpy(&h, b->rx, sizeof(h));
+        if (h.type == AUDIO_MSG_MIC_START) {
+            pthread_mutex_lock(&b->mic_lock);
+            b->mic_active = true;
+            pthread_cond_signal(&b->mic_cond);
+            pthread_mutex_unlock(&b->mic_lock);
+            LOGI("mic active: app started recording");
+            continue;
+        } else if (h.type == AUDIO_MSG_MIC_STOP) {
+            pthread_mutex_lock(&b->mic_lock);
+            b->mic_active = false;
+            pthread_cond_signal(&b->mic_cond);
+            pthread_mutex_unlock(&b->mic_lock);
+            LOGI("mic inactive: app stopped recording");
+            continue;
+        }
         if (h.type != AUDIO_MSG_PCM)
             continue;   /* the producer only sends PCM back; formats flow upstream */
 
@@ -645,14 +663,27 @@ static void *cap_thread_func(void *arg)
 
     while (b->running) {
         int fd = current_fd(b);
-        if (!b->mic_enabled || fd < 0) {
+        if (!b->mic_enabled || !b->mic_active || fd < 0) {
             if (stream) {
                 AAudioStream_requestStop(stream);
                 AAudioStream_close(stream);
                 stream = NULL;
             }
             retry_at = 0;
-            usleep(20000);
+            format_sent = false;
+
+            pthread_mutex_lock(&b->mic_lock);
+            while (b->running && (!b->mic_enabled || !b->mic_active || current_fd(b) < 0)) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 500 * 1000 * 1000L;
+                if (ts.tv_nsec >= 1000 * 1000 * 1000L) {
+                    ts.tv_sec += 1;
+                    ts.tv_nsec -= 1000 * 1000 * 1000L;
+                }
+                pthread_cond_timedwait(&b->mic_cond, &b->mic_lock, &ts);
+            }
+            pthread_mutex_unlock(&b->mic_lock);
             continue;
         }
         if (!stream) {
@@ -695,7 +726,7 @@ static void *cap_thread_func(void *arg)
         };
         struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
         TracyCZoneN(zMicSend, "mic send", 1);
-        if (b->mic_enabled && fd == current_fd(b)) {
+        if (b->mic_enabled && b->mic_active && fd == current_fd(b)) {
             uint32_t quantum = ms_to_frames(b->cap_latency_ms, rate);
             /* The producer must receive the negotiated format before its PCM. */
             if (!format_sent || format_fd != fd || format_quantum != quantum) {
@@ -729,8 +760,11 @@ audio_bridge *audio_create(void)
         return NULL;
     atomic_init(&b->running, false);
     atomic_init(&b->mic_enabled, false);
+    atomic_init(&b->mic_active, false);
     atomic_init(&b->cap_latency_ms, 0);
     pthread_mutex_init(&b->play_lock, NULL);
+    pthread_mutex_init(&b->mic_lock, NULL);
+    pthread_cond_init(&b->mic_cond, NULL);
     return b;
 }
 
@@ -740,6 +774,8 @@ void audio_destroy(audio_bridge *b)
         return;
     audio_stop(b);
     pthread_mutex_destroy(&b->play_lock);
+    pthread_mutex_destroy(&b->mic_lock);
+    pthread_cond_destroy(&b->mic_cond);
     free(b->play_ring);
     free(b);
 }
@@ -770,6 +806,9 @@ void audio_stop(audio_bridge *b)
     if (!b || !b->running)
         return;
     b->running = false;
+    pthread_mutex_lock(&b->mic_lock);
+    pthread_cond_signal(&b->mic_cond);
+    pthread_mutex_unlock(&b->mic_lock);
     pthread_join(b->play_thread, NULL);
     pthread_join(b->cap_thread, NULL);
 
@@ -786,15 +825,22 @@ void audio_stop(audio_bridge *b)
 
 void audio_set_ctx(audio_bridge *b, display_ctx *ctx)
 {
-    if (b)
+    if (b) {
+        pthread_mutex_lock(&b->mic_lock);
         b->ctx = ctx;
+        pthread_cond_signal(&b->mic_cond);
+        pthread_mutex_unlock(&b->mic_lock);
+    }
 }
 
 void audio_set_mic_enabled(audio_bridge *b, int enabled)
 {
     if (!b)
         return;
+    pthread_mutex_lock(&b->mic_lock);
     b->mic_enabled = enabled != 0;
+    pthread_cond_signal(&b->mic_cond);
+    pthread_mutex_unlock(&b->mic_lock);
     LOGI("mic %s", b->mic_enabled ? "enabled" : "disabled");
 }
 
