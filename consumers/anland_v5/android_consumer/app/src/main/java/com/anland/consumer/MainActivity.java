@@ -460,17 +460,45 @@ public class MainActivity extends Activity
         mNative.setCustomResolution(customW, customH);
     }
 
+    private String findLatestDroidspacesSocket() {
+        try {
+            SuCommand.CommandResult res = new SuCommand.SuRunner().run(
+                    "ls -t /data/local/Droidspaces/Net/anland-*.sock 2>/dev/null | head -n 1", 1000L);
+            if (res != null && res.exitCode == 0 && res.stdout != null) {
+                String sock = res.stdout.trim();
+                if (!sock.isEmpty() && isSocketFile(sock)) {
+                    return sock;
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "findLatestDroidspacesSocket failed", t);
+        }
+        return null;
+    }
+
     // The daemon socket this window targets: the launch-Intent override if any,
-    // else the saved pref, else the built-in default. Never null/blank. This is
-    // both the native connection target and this window's dedup key.
+    // else the saved pref, else the latest auto-detected Droidspaces socket, else default.
     private String resolveSocketPath() {
         String sock = mSocketOverride;
-        if (sock == null || sock.trim().isEmpty())
-            sock = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    .getString(KEY_SOCKET_PATH, DEFAULT_SOCKET_PATH);
-        if (sock == null || sock.trim().isEmpty())
-            sock = DEFAULT_SOCKET_PATH;
-        return sock.trim();
+        if (sock != null && !sock.trim().isEmpty()) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putString(KEY_SOCKET_PATH, sock.trim()).apply();
+            return sock.trim();
+        }
+        sock = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(KEY_SOCKET_PATH, null);
+        if (sock != null && !sock.trim().isEmpty() && isSocketFile(sock.trim()))
+            return sock.trim();
+
+        String autoDetected = findLatestDroidspacesSocket();
+        if (autoDetected != null) {
+            Log.i(TAG, "Auto-detected active Droidspaces socket: " + autoDetected);
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putString(KEY_SOCKET_PATH, autoDetected).apply();
+            return autoDetected;
+        }
+
+        return DEFAULT_SOCKET_PATH;
     }
 
     // Start (or restart) this window's native pipeline, but only if the daemon
@@ -672,8 +700,13 @@ public class MainActivity extends Activity
     }
 
     private final Runnable delayedFocusStop = () -> {
-        if (!hasWindowFocus() && mResumed && immersive != null) {
-            Log.i(TAG, "focus remained lost; stopping immersive input");
+        // While the activity is still resumed (in the foreground), temporary system
+        // popups (volume slider, brightness overlay, screenshot previews, toast/heads-up)
+        // cause window focus loss without triggering onPause().
+        // Do NOT stop immersive evdev grab in that case, so volume/brightness keys
+        // or touching the screen continues to work uninterrupted.
+        if (!hasWindowFocus() && !mResumed && immersive != null) {
+            Log.i(TAG, "activity paused and focus remained lost; stopping immersive input");
             if (immersive.isActive())
                 armAutomaticImmersiveEntry();
             immersive.stop();
@@ -2836,8 +2869,89 @@ public class MainActivity extends Activity
         movePointerBy(dx * scale, dy * scale);
     }
 
+    private static boolean isMediaControlEvdev(int evdev) {
+        return evdev == 224 // KEY_BRIGHTNESSDOWN
+                || evdev == 225 // KEY_BRIGHTNESSUP
+                || evdev == 248 // KEY_MICMUTE
+                || evdev == 530 // KEY_TOUCHPAD_TOGGLE
+                || evdev == 531 // KEY_TOUCHPAD_ON
+                || evdev == 532 // KEY_TOUCHPAD_OFF
+                || evdev == 99  // KEY_SYSRQ (Screenshot)
+                || evdev == 212 // KEY_SCREENSHOT / KEY_CAMERA
+                || evdev == 142 // KEY_SLEEP (Lock screen)
+                || evdev == 116 // KEY_POWER
+                || evdev == 165 // KEY_PREVIOUSSONG
+                || evdev == 164 // KEY_PLAYPAUSE
+                || evdev == 200 // KEY_PLAYCD
+                || evdev == 201 // KEY_PAUSECD
+                || evdev == 163 // KEY_NEXTSONG
+                || evdev == 166 // KEY_STOPCD
+                || evdev == 168 // KEY_REWIND
+                || evdev == 208 // KEY_FASTFORWARD
+                || evdev == 113 // KEY_MUTE (Volume mute)
+                || evdev == 114 // KEY_VOLUMEDOWN
+                || evdev == 115; // KEY_VOLUMEUP
+    }
+
+    private static int evdevToAndroidKeyCode(int evdev) {
+        switch (evdev) {
+            case 224: return KeyEvent.KEYCODE_BRIGHTNESS_DOWN; // 220
+            case 225: return KeyEvent.KEYCODE_BRIGHTNESS_UP;   // 221
+            case 248: return KeyEvent.KEYCODE_MUTE;            // 91 (Mic Mute)
+            case 99:
+            case 212: return KeyEvent.KEYCODE_SYSRQ;           // 120 (Screenshot)
+            case 142:
+            case 116: return KeyEvent.KEYCODE_SLEEP;           // 223 (Lock screen)
+            case 165: return KeyEvent.KEYCODE_MEDIA_PREVIOUS;  // 88
+            case 164:
+            case 200:
+            case 201: return KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE;// 85
+            case 163: return KeyEvent.KEYCODE_MEDIA_NEXT;      // 87
+            case 166: return KeyEvent.KEYCODE_MEDIA_STOP;      // 86
+            case 168: return KeyEvent.KEYCODE_MEDIA_REWIND;    // 89
+            case 208: return KeyEvent.KEYCODE_MEDIA_FAST_FORWARD; // 90
+            case 113: return KeyEvent.KEYCODE_VOLUME_MUTE;     // 164
+            case 114: return KeyEvent.KEYCODE_VOLUME_DOWN;     // 25
+            case 115: return KeyEvent.KEYCODE_VOLUME_UP;       // 24
+            case 530:
+            case 531:
+            case 532: return 0;
+            default: return 0;
+        }
+    }
+
+    private void dispatchMediaControlEvdev(int action, int evdev) {
+        if (action != 0) // Only fire on key down
+            return;
+        int keycode = evdevToAndroidKeyCode(evdev);
+        Log.i("AnlandMedia", "dispatchMediaControlEvdev: evdev=" + evdev + " -> mapped keycode=" + keycode);
+        if (evdev == 115 || evdev == 114 || evdev == 113) {
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                int direction = (evdev == 115) ? AudioManager.ADJUST_RAISE
+                        : (evdev == 114 ? AudioManager.ADJUST_LOWER : AudioManager.ADJUST_TOGGLE_MUTE);
+                am.adjustVolume(direction, AudioManager.FLAG_SHOW_UI | AudioManager.FLAG_PLAY_SOUND);
+            }
+            return;
+        }
+        if (keycode > 0) {
+            new Thread(() -> {
+                try {
+                    new SuCommand.SuRunner().run("input keyevent " + keycode, 1000);
+                } catch (Throwable ignored) {}
+            }).start();
+        }
+    }
+
     @Override
     public void sendKey(int action, int evdev) {
+        if (action == 0) {
+            Log.i("AnlandMedia", "sendKey: action=0, evdev=" + evdev + (isMediaControlEvdev(evdev) ? " [MEDIA_INTERCEPTED]" : " [FORWARD_TO_LINUX]"));
+        }
+        if (isMediaControlEvdev(evdev)) {
+            dispatchMediaControlEvdev(action, evdev);
+            return;
+        }
         if (mNative != null)
             mNative.sendKey(action, evdev);
     }
@@ -3031,8 +3145,32 @@ public class MainActivity extends Activity
         return handleSourceAwareKey(event) || super.dispatchKeyEvent(event);
     }
 
+    private static boolean isVolumeKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_VOLUME_UP
+                || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+                || keyCode == KeyEvent.KEYCODE_VOLUME_MUTE;
+    }
+
+    private static boolean isMediaControlKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY
+                || keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE
+                || keyCode == KeyEvent.KEYCODE_MEDIA_NEXT
+                || keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                || keyCode == KeyEvent.KEYCODE_MEDIA_STOP
+                || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
+                || keyCode == KeyEvent.KEYCODE_MEDIA_REWIND
+                || keyCode == KeyEvent.KEYCODE_BRIGHTNESS_UP
+                || keyCode == KeyEvent.KEYCODE_BRIGHTNESS_DOWN;
+    }
+
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
+        Log.i("AnlandMedia", "onKeyDown: keyCode=" + keyCode + " (" + KeyEvent.keyCodeToString(keyCode) + ") scanCode=" + event.getScanCode());
+        if (isVolumeKey(keyCode) || isMediaControlKey(keyCode))
+            return super.onKeyDown(keyCode, event);
+        if (handleSourceAwareKey(event))
+            return true;
         // Before the repeat swallow: each repeat must become one more tap, so
         // held-key auto-repeat still works (see handleImeDelTap).
         if (handleImeDelTap(event))
@@ -3067,6 +3205,8 @@ public class MainActivity extends Activity
     // Called from KeyInterceptor (accessibility service) to handle keys that
     // the normal onKeyDown/onKeyUp might miss (e.g. Fn combos).
     public boolean handleAccessibilityKey(KeyEvent event) {
+        if (isVolumeKey(event.getKeyCode()) || isMediaControlKey(event.getKeyCode()))
+            return false;
         // The same decision boundary as the Activity paths: with interception on
         // this is the only ingress, and the two must not diverge.
         if (handleSourceAwareKey(event))
@@ -3173,6 +3313,10 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (isVolumeKey(keyCode) || isMediaControlKey(keyCode))
+            return super.onKeyUp(keyCode, event);
+        if (handleSourceAwareKey(event))
+            return true;
         if (handleImeDelTap(event))
             return true;
         forwardKeyToLinux(event);
