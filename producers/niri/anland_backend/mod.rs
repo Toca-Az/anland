@@ -348,6 +348,7 @@ impl Anland {
         // for the focused text-input-v3 client even when no Wayland IME is bound.
         // Enable before focus is established so Smithay sends enter on focus.
         niri.seat.text_input().set_compositor_input_method(true);
+        let _ = niri.seat.add_touch();
         #[cfg(have_anland_audio)]
         if unsafe { ffi::anland_audio_start() } != 0 {
             warn!("anland: failed to start audio engine");

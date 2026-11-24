@@ -1,0 +1,196 @@
+﻿From: Antigravity <antigravity@google.com>
+Subject: [PATCH] xwayland: map rootless override-redirect popups and menus to wl_subsurface
+
+Rootless Xwayland historically never surfaced override-redirect windows
+(menus, dropdowns, tooltips) because miniwm only intercepts MapRequest
+and override-redirect windows bypass window management per X11 spec.
+
+This patch implements universal low-level subsurface projection:
+1. Bind wl_subcompositor in xwayland-screen.
+2. In xwl_realize_window, automatically call compRedirectWindow for rootless
+   override-redirect windows so they receive a dedicated pixmap and damage tracking.
+3. Automatically match the parent xwl_window using client mask (wClient)
+   and geometry containment.
+4. Call wl_subcompositor_get_subsurface, wl_subsurface_set_position,
+   and wl_subsurface_set_desync so the popup renders directly on top of the
+   main application window in Wayland without creating detached Android windows.
+5. Destroy wl_subsurface when the window is unrealized or destroyed.
+---
+ hw/xwayland/xwayland-screen.c |  4 +++
+ hw/xwayland/xwayland-screen.h |  1 +
+ hw/xwayland/xwayland-window.c | 56 +++++++++++++++++++++++++++++++++--
+ hw/xwayland/xwayland-window.h |  1 +
+ 4 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/hw/xwayland/xwayland-screen.h b/hw/xwayland/xwayland-screen.h
+index 1111111..2222222 100644
+--- a/hw/xwayland/xwayland-screen.h
++++ b/hw/xwayland/xwayland-screen.h
+@@ -102,6 +102,7 @@ struct xwl_screen {
+     struct wl_compositor *compositor;
++    struct wl_subcompositor *subcompositor;
+     struct zwp_tablet_manager_v2 *tablet_manager;
+     struct wl_shm *shm;
+     struct xdg_wm_base *xdg_wm_base;
+diff --git a/hw/xwayland/xwayland-window.h b/hw/xwayland/xwayland-window.h
+index 1111111..2222222 100644
+--- a/hw/xwayland/xwayland-window.h
++++ b/hw/xwayland/xwayland-window.h
+@@ -101,6 +101,7 @@ struct xwl_window {
+     struct xwayland_surface_v1 *xwayland_surface;
++    struct wl_subsurface *subsurface;
+     struct xwl_dmabuf_feedback feedback;
+     /* If TRUE, the window buffer format supports scanout with implicit modifier */
+     Bool has_implicit_scanout_support;
+diff --git a/hw/xwayland/xwayland-screen.c b/hw/xwayland/xwayland-screen.c
+index 1111111..2222222 100644
+--- a/hw/xwayland/xwayland-screen.c
++++ b/hw/xwayland/xwayland-screen.c
+@@ -530,6 +530,10 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
+     else if (strcmp(interface, xwayland_shell_v1_interface.name) == 0 && xwl_screen->rootless) {
+         xwl_screen->xwayland_shell =
+             wl_registry_bind(registry, id, &xwayland_shell_v1_interface, 1);
++    }
++    else if (strcmp(interface, wl_subcompositor_interface.name) == 0) {
++        xwl_screen->subcompositor =
++            wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
+     }
+     else if (strcmp(interface, wp_tearing_control_manager_v1_interface.name) == 0) {
+         xwl_screen->tearing_control_manager =
+diff --git a/hw/xwayland/xwayland-window.c b/hw/xwayland/xwayland-window.c
+index 1111111..2222222 100644
+--- a/hw/xwayland/xwayland-window.c
++++ b/hw/xwayland/xwayland-window.c
+@@ -1460,6 +1460,45 @@ xwl_window_buffers_init(struct xwl_window *xwl_window)
+     xorg_list_init(&xwl_window->window_buffers_unavailable);
+ }
+ 
++static struct xwl_window *
++xwl_find_parent_for_or_window(struct xwl_screen *xwl_screen, WindowPtr window)
++{
++    struct xwl_window *xwl_win, *best = NULL;
++    ClientPtr client = wClient(window);
++    int wx = window->drawable.x;
++    int wy = window->drawable.y;
++
++    xorg_list_for_each_entry(xwl_win, &xwl_screen->window_list, link_window) {
++        if (xwl_win->subsurface || !xwl_win->surface)
++            continue;
++        if (xwl_win->toplevel && wClient(xwl_win->toplevel) == client) {
++            int px = xwl_win->toplevel->drawable.x;
++            int py = xwl_win->toplevel->drawable.y;
++            int pw = xwl_win->toplevel->drawable.width;
++            int ph = xwl_win->toplevel->drawable.height;
++            if (wx >= px && wx < px + pw && wy >= py && wy < py + ph)
++                return xwl_win;
++            if (!best)
++                best = xwl_win;
++        }
++    }
++
++    if (best)
++        return best;
++
++    xorg_list_for_each_entry(xwl_win, &xwl_screen->window_list, link_window) {
++        if (xwl_win->subsurface || !xwl_win->surface)
++            continue;
++        if (xwl_win->toplevel) {
++            int px = xwl_win->toplevel->drawable.x;
++            int py = xwl_win->toplevel->drawable.y;
++            int pw = xwl_win->toplevel->drawable.width;
++            int ph = xwl_win->toplevel->drawable.height;
++            if (wx >= px && wx < px + pw && wy >= py && wy < py + ph)
++                return xwl_win;
++        }
++    }
++
++    xorg_list_for_each_entry(xwl_win, &xwl_screen->window_list, link_window) {
++        if (!xwl_win->subsurface && xwl_win->surface && xwl_win->toplevel)
++            return xwl_win;
++    }
++
++    return NULL;
++}
++
+ static struct xwl_window *
+ ensure_surface_for_window(WindowPtr window)
+ {
+@@ -1495,6 +1534,22 @@ ensure_surface_for_window(WindowPtr window)
+     if (xwl_window->surface == NULL) {
+         ErrorF(" wl_display_create_surface failed\\n\);
+ goto err;
+ }
+ 
++ if (xwl_screen->rootless && window->overrideRedirect) {
++ struct xwl_window *parent_xwl = xwl_find_parent_for_or_window(xwl_screen, window);
++ if (parent_xwl && parent_xwl->toplevel && xwl_screen->subcompositor) {
++ int rel_x = window->drawable.x - parent_xwl->toplevel->drawable.x;
++ int rel_y = window->drawable.y - parent_xwl->toplevel->drawable.y;
++ xwl_window->subsurface = wl_subcompositor_get_subsurface(
++ xwl_screen->subcompositor, xwl_window->surface, parent_xwl->surface);
++ if (xwl_window->subsurface) {
++ wl_subsurface_set_position(xwl_window->subsurface, rel_x, rel_y);
++ wl_subsurface_set_desync(xwl_window->subsurface);
++ wl_surface_commit(parent_xwl->surface);
++ }
++ }
++ } else {
+ if (xwl_screen->xwayland_shell) {
+ xwl_window->xwayland_surface = xwayland_shell_v1_get_xwayland_surface(
+ xwl_screen->xwayland_shell, xwl_window->surface);
+ }
+ 
+ if (!xwl_screen->rootless && !xwl_create_root_surface(xwl_window))
+ goto err;
++ }
+ 
+ wl_display_flush(xwl_screen->display);
+ 
+- send_surface_id_event(xwl_window);
++ if (!xwl_window->subsurface)
++ send_surface_id_event(xwl_window);
+@@ -1600,6 +1655,13 @@ xwl_realize_window(WindowPtr window)
+ if (!ret)
+ return FALSE;
+ 
++ if (xwl_screen->rootless && window->overrideRedirect &&
++ window->drawable.class == InputOutput &&
++ window->parent == window->drawable.pScreen->root) {
++ if (window->redirectDraw != RedirectDrawManual) {
++ compRedirectWindow(serverClient, window, CompositeRedirectManual);
++ }
++ }
++
+ if (xwl_screen->rootless ?
+ (window->drawable.class == InputOutput &&
+ window->parent == window->drawable.pScreen->root) :
+@@ -1675,6 +1737,11 @@ static void
+ release_wl_surface_for_window(struct xwl_window *xwl_window)
+ {
++ if (xwl_window->subsurface) {
++ wl_subsurface_destroy(xwl_window->subsurface);
++ xwl_window->subsurface = NULL;
++ wl_surface_destroy(xwl_window->surface);
++ }
+ else if (xwl_window->xwayland_surface)
+ release_wl_surface_for_window_shell(xwl_window);
+ else
+@@ -1950,6 +2017,15 @@ xwl_move_window(WindowPtr window,
+ xwl_screen->MoveWindow = screen->MoveWindow;
+ screen->MoveWindow = xwl_move_window;
+ 
++ if (xwl_window && xwl_window->subsurface) {
++ struct xwl_window *parent_xwl = xwl_find_parent_for_or_window(xwl_screen, window);
++ if (parent_xwl && parent_xwl->toplevel) {
++ int rel_x = window->drawable.x - parent_xwl->toplevel->drawable.x;
++ int rel_y = window->drawable.y - parent_xwl->toplevel->drawable.y;
++ wl_subsurface_set_position(xwl_window->subsurface, rel_x, rel_y);
++ wl_surface_commit(parent_xwl->surface);
++ }
++ }
++
+ if (xwl_window && (xwl_window_get(window) || xwl_window_is_toplevel(window)))
+ xwl_window_check_resolution_change_emulation(xwl_window);
+ }
+-- 
+2.43.0

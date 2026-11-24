@@ -1,0 +1,10 @@
+--- a/hw/xwayland/xwayland-input.c
++++ b/hw/xwayland/xwayland-input.c
+@@ -1882,6 +1882,7 @@
+         ActivateDevice(xwl_seat->touch, TRUE);
+     }
+     enable_device(xwl_seat, xwl_seat->touch);
++    AttachDevice(serverClient, xwl_seat->touch, inputInfo.pointer);
+ }
+ 
+ static void
