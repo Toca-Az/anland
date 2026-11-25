@@ -16,7 +16,7 @@ backup=(etc/mango-anland/config.conf)
 source=(
     'mango::git+https://github.com/DreamMaoMao/mango.git'
     'wlroots::git+https://gitlab.freedesktop.org/wlroots/wlroots.git#commit=d783533489e1f75d6886c2ab5c5960090ef268f8'
-    'scenefx::git+https://github.com/wlrfx/scenefx.git'
+    'scenefx::git+https://github.com/wlrfx/scenefx.git#commit=37ccd723bef49e6891156ffafce8f549f01446cc'
     'anland-inputs.tar.gz'
 )
 
