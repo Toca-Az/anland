@@ -3,6 +3,7 @@
 #endif
 #include "display_producer.h"
 #include "socket_utils.h"
+#include "anland_audio.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -116,6 +117,7 @@ static void release_consumer_resources(display_ctx *ctx)
     if (ctx->data_fd >= 0)          { close(ctx->data_fd);          ctx->data_fd = -1; }
     if (ctx->buf_ready_efd >= 0)    { close(ctx->buf_ready_efd);    ctx->buf_ready_efd = -1; }
     if (ctx->fence_fd >= 0)         { close(ctx->fence_fd);         ctx->fence_fd = -1; }
+    anland_audio_set_fd(-1);
     if (ctx->audio_fd >= 0)         { close(ctx->audio_fd);         ctx->audio_fd = -1; }
     if (ctx->pending_render_fence >= 0) { close(ctx->pending_render_fence); ctx->pending_render_fence = -1; }
     if (ctx->shm_ptr)               { munmap((void *)ctx->shm_ptr, sizeof(uint32_t)); ctx->shm_ptr = NULL; }
@@ -196,6 +198,7 @@ static int pickup_fds(display_ctx *ctx)
     ctx->data_fd=ctx->pickup.fds[2];
     ctx->shm_fd=ctx->pickup.fds[3];
     ctx->audio_fd=ctx->pickup.fds[4];
+    anland_audio_set_fd(ctx->audio_fd);
     ctx->pickup.fd_count=0;
     ctx->pickup_requested=false;
     ctx->shm_ptr=mmap(NULL,sizeof(uint32_t),PROT_READ,MAP_SHARED,ctx->shm_fd,0);
