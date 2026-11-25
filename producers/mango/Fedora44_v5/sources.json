@@ -9,11 +9,12 @@
       "revision": "d783533489e1f75d6886c2ab5c5960090ef268f8"
     },
     "scenefx": {
-      "url": "https://github.com/wlrfx/scenefx.git"
+      "url": "https://github.com/wlrfx/scenefx.git",
+      "revision": "37ccd723bef49e6891156ffafce8f549f01446cc"
     }
   },
   "patches": {
-    "mango.patch": "5d4dddc3f15989a3b4b1b81485865cbbcf3eda062419843199f361272ca42a69",
+    "mango.patch": "336da46680d9265abf46b1449e50f0061d1217f405425abe05ace37a8c66f73a",
     "wlroots.patch": "aa6779bac078b448a31bd34dc1914aa99c7635cbfccc4ecd9a7d66543911c239",
     "scenefx.patch": "212c2a0972d6275180268869a6a7c2747d0f884b0831376eb9ef36b39743322c"
   },

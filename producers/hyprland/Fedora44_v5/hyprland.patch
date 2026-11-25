@@ -1,5 +1,7 @@
 Subject: Anland v5 hyprland native integration (Debian 13)
 
+Backport the Hyprpaper enum fix from Hyprland commit 488f968239e036502cda9e68361aaa8c8e0179c3.
+
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -280,7 +280,7 @@ pkg_check_modules(
@@ -99,6 +101,13 @@ Subject: Anland v5 hyprland native integration (Debian 13)
  add_executable(hyprpm ${SRCFILES})
 
  target_link_libraries(hyprpm PUBLIC PkgConfig::hyprpm_deps glaze::glaze)
+--- a/hyprctl/hw-protocols/hyprpaper_core.xml
++++ b/hyprctl/hw-protocols/hyprpaper_core.xml
+@@ -141,3 +141,3 @@
+       </description>
+-      <arg name="error" type="enum" interface="hyprpaper_wallpaper_application_error" summary="path"/>
++      <arg name="error" type="enum" interface="applying_error" summary="path"/>
+     </s2c>
 --- a/src/Compositor.cpp
 +++ b/src/Compositor.cpp
 @@ -1,3 +1,5 @@

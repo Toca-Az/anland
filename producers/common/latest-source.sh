@@ -114,15 +114,19 @@ anland_prepare_latest_git_source() {
     mkdir -p "$downloads" "$workdir/src" || return 1
 
     if [[ $offline == 1 ]]; then
-        [[ -s $record ]] || {
-            printf 'No previously resolved latest %s commit for offline use\n' "$name" >&2
-            return 1
-        }
-        IFS=$'\t' read -r commit < "$record"
-        [[ $commit =~ ^[0-9a-f]{40,64}$ ]] || return 1
+        if [[ $ref =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            commit=$ref
+        else
+            [[ -s $record ]] || {
+                printf 'No previously resolved latest %s commit for offline use\n' "$name" >&2
+                return 1
+            }
+            IFS=$'\t' read -r commit < "$record"
+            [[ $commit =~ ^[0-9a-f]{40,64}$ ]] || return 1
+        fi
         repo="$downloads/$name-$commit$suffix.git"
         [[ -d $repo/.git || -f $repo/HEAD ]] || {
-            printf 'Cached %s repository is missing\n' "$name" >&2
+            printf 'Cached %s repository for %s is missing\n' "$name" "$commit" >&2
             return 1
         }
     else
