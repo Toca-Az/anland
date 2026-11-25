@@ -505,8 +505,12 @@ static void on_reconnect_timer(void *data, uint64_t expirations)
 
 /* ---- public API ---- */
 
+static int s_saved_audio_fd = -1;
+
 void anland_audio_set_fd(int audio_fd)
 {
+    s_saved_audio_fd = audio_fd;
+    fprintf(stderr, "anland-audio: audio_fd set to %d\n", audio_fd);
     struct anland_audio *a = g_audio;
     if (!a)
         return;
@@ -586,6 +590,9 @@ int anland_audio_start(void)
     pw_thread_loop_unlock(a->loop);
 
     g_audio = a;
+    if (s_saved_audio_fd >= 0) {
+        anland_audio_set_fd(s_saved_audio_fd);
+    }
     return 0;
 
 fail:
