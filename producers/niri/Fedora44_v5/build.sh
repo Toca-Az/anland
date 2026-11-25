@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Fedora 44 aarch64: Niri/Smithay + satellite + patched Xwayland native RPMs.
+# Fedora aarch64: Niri/Smithay + satellite + patched Xwayland native RPMs.
 # ANLAND_STAGE=check|prepare|build ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0
 set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+FEDORA_RELEASE=${SCRIPT_DIR##*/Fedora}
+FEDORA_RELEASE=${FEDORA_RELEASE%_v5}
 source "$SCRIPT_DIR/../../common/latest-source.sh"
-# Fedora build/package functions are local to this WM recipe.
 fedora_die() { printf 'fedora-build: %s\n' "$*" >&2; exit 1; }
 
 fedora_run() { "$@" || fedora_die "failed: $*"; }
@@ -12,8 +13,8 @@ fedora_run() { "$@" || fedora_die "failed: $*"; }
 fedora_preflight() {
     local ID VERSION_ID
     source /etc/os-release || fedora_die 'cannot identify distribution'
-    [[ $ID == fedora && $VERSION_ID == 44 && $(uname -m) == aarch64 ]] ||
-        fedora_die 'requires native Fedora 44 aarch64'
+    [[ $ID == fedora && $VERSION_ID == "$FEDORA_RELEASE" && $VERSION_ID =~ ^4[45]$ && $(uname -m) == aarch64 ]] ||
+        fedora_die "requires native Fedora $FEDORA_RELEASE aarch64"
     [[ $(id -u) != 0 ]] || fedora_die 'compile as an ordinary user'
     JOBS=${JOBS:-4}
     [[ $JOBS =~ ^[1-9][0-9]*$ ]] || fedora_die 'JOBS must be a positive integer'
@@ -31,8 +32,8 @@ fedora_preflight() {
 fedora_initialize() {
     fedora_preflight
     ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd -P) || fedora_die 'repository root'
-    source "$ROOT/producers/common/fedora-latest-srpm.sh"
-    WORKDIR=$(realpath -m -- "${WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/anland-$1-fedora44}") || fedora_die 'cache path'
+    source "$ROOT/producers/common/fedora-latest-srpm.sh" || fedora_die 'cannot load shared Fedora build functions'
+    WORKDIR=$(realpath -m -- "${WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/anland-$1-fedora${FEDORA_RELEASE}}") || fedora_die 'cache path'
     ARTIFACTS_DIR=$(realpath -m -- "${ARTIFACTS_DIR:-${ARTIFACTS:-$SCRIPT_DIR/artifacts}}") || fedora_die 'artifact path'
     [[ $WORKDIR != / && $WORKDIR != "$HOME" && $WORKDIR != "$ROOT" && $WORKDIR != "$ROOT/"* ]] || fedora_die 'WORKDIR must be a separate cache'
     [[ $ARTIFACTS_DIR != / && $ARTIFACTS_DIR != "$HOME" && $ARTIFACTS_DIR != "$ROOT" && $ARTIFACTS_DIR != "$WORKDIR" ]] || fedora_die 'unsafe artifact directory'
@@ -50,7 +51,7 @@ fedora_initialize() {
 import hashlib, pathlib, sys
 root, recipe = map(pathlib.Path, sys.argv[1:])
 h = hashlib.sha256()
-paths = [recipe/'build.sh']
+paths = [recipe/'build.sh', root/'producers/common/fedora-latest-srpm.sh']
 for folder in (recipe, recipe.parent/'anland_backend', root/'libdisplay_producer', root/'common'):
     paths += [p for p in folder.rglob('*') if p.is_file() and 'artifacts' not in p.parts]
 for p in sorted(set(paths)):
@@ -145,9 +146,9 @@ EOF
     local sonames
     sonames=$(find "$stage" -type f -name '*.so*' -exec readelf -d {} \; 2>/dev/null | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p' | sort -u | sed 's/[.]/\\./g' | paste -sd '|') || fedora_die 'private SONAME list'
     [[ -z $sonames ]] || printf '%%global __requires_exclude ^(%s)(\\(.*\\))?$\n' "$sonames" >> "$spec" || fedora_die 'private RPM dependencies'
-    cat >> "$spec" <<'EOF'
+    cat >> "$spec" <<EOF
 %description
-Native Fedora 44 runtime built from current upstream sources. Installing this package
+Native Fedora $FEDORA_RELEASE runtime built from current upstream sources. Installing this package
 does not enable, stop or restart graphical sessions or desktop services.
 %prep
 %build
@@ -168,17 +169,6 @@ EOF
     fedora_run rm -f -- "$marker"
 }
 
-fedora_publish_rpm() {
-    local file=$1 destination="$ARTIFACTS_DIR/${1##*/}" architecture
-    architecture=$(rpm -qp --qf '%{ARCH}' "$file") || fedora_die 'RPM architecture'
-    [[ $architecture == aarch64 || $architecture == noarch ]] || fedora_die "wrong architecture: $file"
-    fedora_run rpm -K "$file"
-    fedora_run rpm -qpl "$file" >/dev/null
-    [[ ! -e $destination.sig && ! -L $destination.sig ]] || cmp -s "$file" "$destination" || fedora_die "existing signature preserved: $destination.sig"
-    fedora_run cp -p -- "$file" "$destination"
-    packages+=("$destination")
-}
-
 fedora_srpm_build() {
     local top=$FEDORA_SRPM_TOP spec=$FEDORA_SRPM_SPEC marker file found=0
     if [[ $ANLAND_WITH_DEPS == 1 ]]; then
@@ -195,20 +185,14 @@ fedora_srpm_build() {
     fedora_run rm -f -- "$marker"
 }
 
-fedora_xwayland() {
-    # Every WM keeps its Xwayland inputs alongside its own distro recipe.
-    fedora_srpm_prepare xorg-x11-server-Xwayland "$SCRIPT_DIR/xwayland.patch"
-    [[ $ANLAND_STAGE != build ]] || fedora_srpm_build
-}
-
 fedora_finish() {
     [[ ${#packages[@]} -gt 0 ]] || fedora_die 'empty Fedora package set'
     printf '%s\n' "${packages[@]##*/}" > "$WORKDIR/packages.list" || fedora_die 'package list'
     (cd "$ARTIFACTS_DIR" && sha256sum -- "${packages[@]##*/}" > "$WORKDIR/SHA256SUMS" && sha256sum -c "$WORKDIR/SHA256SUMS") || fedora_die 'package checksums'
-    python3 - "$ROOT" "$FEDORA_INPUT_ID" "$WORKDIR/build-inputs.json" <<'PY' || fedora_die 'build record'
+    python3 - "$ROOT" "$FEDORA_INPUT_ID" "$WORKDIR/build-inputs.json" "fedora$FEDORA_RELEASE" <<'PY' || fedora_die 'build record'
 import json,subprocess,sys
-root,identity,out=sys.argv[1:]
-record={'distribution':'fedora44','architecture':'aarch64','input_sha256':identity,
+root,identity,out,distribution=sys.argv[1:]
+record={'distribution':distribution,'architecture':'aarch64','input_sha256':identity,
  'anland_revision':subprocess.check_output(['git','-C',root,'rev-parse','HEAD'],text=True).strip(),
  'graphical_test':False}
 open(out,'w').write(json.dumps(record,indent=2)+'\n')
@@ -227,7 +211,7 @@ fedora_dependencies cargo rust clang-devel pipewire-devel libinput-devel systemd
     wayland-devel wayland-protocols-devel pango-devel cairo-devel cairo-gobject-devel pixman-devel \
     fontconfig-devel libxcb-devel xcb-util-cursor-devel libX11-devel
 if [[ $ANLAND_STAGE == check ]]; then
-    printf 'FEDORA44_RECIPE_OK niri (no compilation or graphical test)\n'; exit 0
+    printf 'FEDORA%s_RECIPE_OK niri (no compilation or graphical test)\n' "$FEDORA_RELEASE"; exit 0
 fi
 fedora_run mkdir -p "$WORKDIR/src"
 export CARGO_HOME="$WORKDIR/cargo-home" CARGO_TARGET_DIR="$WORKDIR/cargo-target"
@@ -266,7 +250,7 @@ if not isinstance(version, str): raise SystemExit('Cargo package version is miss
 print(version)
 PY_VERSION
 }
-if [[ $ANLAND_STAGE == prepare ]]; then fedora_xwayland; printf 'FEDORA44_PREPARED niri\n'; exit 0; fi
+if [[ $ANLAND_STAGE == prepare ]]; then fedora_xwayland; printf 'FEDORA%s_PREPARED niri\n' "$FEDORA_RELEASE"; exit 0; fi
 niri="${source_tree[niri]}"; satellite="${source_tree[satellite]}"
 fetch=(--locked --target aarch64-unknown-linux-gnu)
 [[ $ANLAND_OFFLINE == 0 ]] || fetch+=(--offline)

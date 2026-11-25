@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Fedora 44 ARM64: the same locked Denial/Flutter build, native RPM packaging.
+# Fedora ARM64: the same locked Denial/Flutter build, native RPM packaging.
 # ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash build.sh [--noconfirm]
 # ANLAND_STAGE=check validates the recipe without compiling or touching services.
-# Fedora build/package functions are local to this WM recipe.
 fedora_die() { printf 'fedora-build: %s\n' "$*" >&2; exit 1; }
 
 fedora_run() { "$@" || fedora_die "failed: $*"; }
 
 fedora_preflight() {
     local ID VERSION_ID
+    FEDORA_RELEASE=${ANLAND_DENIAL_DISTRO#fedora}
     source /etc/os-release || fedora_die 'cannot identify distribution'
-    [[ $ID == fedora && $VERSION_ID == 44 && $(uname -m) == aarch64 ]] ||
-        fedora_die 'requires native Fedora 44 aarch64'
+    [[ $ID == fedora && $VERSION_ID == "$FEDORA_RELEASE" && $VERSION_ID =~ ^4[45]$ && $(uname -m) == aarch64 ]] ||
+        fedora_die "requires native Fedora $FEDORA_RELEASE aarch64"
     [[ $(id -u) != 0 ]] || fedora_die 'compile as an ordinary user'
     JOBS=${JOBS:-4}
     [[ $JOBS =~ ^[1-9][0-9]*$ ]] || fedora_die 'JOBS must be a positive integer'
@@ -83,9 +83,9 @@ EOF
     local sonames
     sonames=$(find "$stage" -type f -name '*.so*' -exec readelf -d {} \; 2>/dev/null | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p' | sort -u | sed 's/[.]/\\./g' | paste -sd '|') || fedora_die 'private SONAME list'
     [[ -z $sonames ]] || printf '%%global __requires_exclude ^(%s)(\\(.*\\))?$\n' "$sonames" >> "$spec" || fedora_die 'private RPM dependencies'
-    cat >> "$spec" <<'EOF'
+    cat >> "$spec" <<EOF
 %description
-Native Fedora 44 runtime built from current upstream sources. Installing this package
+Native Fedora $FEDORA_RELEASE runtime built from current upstream sources. Installing this package
 does not enable, stop or restart graphical sessions or desktop services.
 %prep
 %build
@@ -106,17 +106,6 @@ EOF
     fedora_run rm -f -- "$marker"
 }
 
-fedora_publish_rpm() {
-    local file=$1 destination="$ARTIFACTS_DIR/${1##*/}" architecture
-    architecture=$(rpm -qp --qf '%{ARCH}' "$file") || fedora_die 'RPM architecture'
-    [[ $architecture == aarch64 || $architecture == noarch ]] || fedora_die "wrong architecture: $file"
-    fedora_run rpm -K "$file"
-    fedora_run rpm -qpl "$file" >/dev/null
-    [[ ! -e $destination.sig && ! -L $destination.sig ]] || cmp -s "$file" "$destination" || fedora_die "existing signature preserved: $destination.sig"
-    fedora_run cp -p -- "$file" "$destination"
-    packages+=("$destination")
-}
-
 fedora_srpm_build() {
     local top=$FEDORA_SRPM_TOP spec=$FEDORA_SRPM_SPEC marker file found=0
     if [[ $ANLAND_WITH_DEPS == 1 ]]; then
@@ -133,20 +122,14 @@ fedora_srpm_build() {
     fedora_run rm -f -- "$marker"
 }
 
-fedora_xwayland() {
-    # Every WM keeps its Xwayland inputs alongside its own distro recipe.
-    fedora_srpm_prepare xorg-x11-server-Xwayland "$SCRIPT_DIR/xwayland.patch"
-    [[ $ANLAND_STAGE != build ]] || fedora_srpm_build
-}
-
 fedora_finish() {
     [[ ${#packages[@]} -gt 0 ]] || fedora_die 'empty Fedora package set'
     printf '%s\n' "${packages[@]##*/}" > "$WORKDIR/packages.list" || fedora_die 'package list'
     (cd "$ARTIFACTS_DIR" && sha256sum -- "${packages[@]##*/}" > "$WORKDIR/SHA256SUMS" && sha256sum -c "$WORKDIR/SHA256SUMS") || fedora_die 'package checksums'
-    python3 - "$ROOT" "$FEDORA_INPUT_ID" "$WORKDIR/build-inputs.json" <<'PY' || fedora_die 'build record'
+    python3 - "$ROOT" "$FEDORA_INPUT_ID" "$WORKDIR/build-inputs.json" "fedora$FEDORA_RELEASE" <<'PY' || fedora_die 'build record'
 import json,subprocess,sys
-root,identity,out=sys.argv[1:]
-record={'distribution':'fedora44','architecture':'aarch64','input_sha256':identity,
+root,identity,out,distribution=sys.argv[1:]
+record={'distribution':distribution,'architecture':'aarch64','input_sha256':identity,
  'anland_revision':subprocess.check_output(['git','-C',root,'rev-parse','HEAD'],text=True).strip(),
  'graphical_test':False}
 open(out,'w').write(json.dumps(record,indent=2)+'\n')
@@ -162,10 +145,15 @@ fedora_denial_preflight() {
     fedora_preflight
     # The shared engine entry already owns WORKDIR/ARTIFACTS locks.
     ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd -P) || die 'repository root'
-    source "$ROOT/producers/common/fedora-latest-srpm.sh"
-    FEDORA_INPUT_ID=$(cat "$SCRIPT_DIR/sources.conf" "$SCRIPT_DIR/build.sh" \
-        "$SCRIPT_DIR/xwayland.patch" "$ROOT/producers/common/fedora-latest-srpm.sh" \
-        "$ROOT/producers/denial/Arch_v5/build.sh" | sha256sum) || die 'Fedora input identity'
+    source "$ROOT/producers/common/fedora-latest-srpm.sh" || fedora_die 'cannot load shared Fedora build functions'
+    FEDORA_INPUT_ID=$(
+        {
+            printf '%s\n' "$ANLAND_DENIAL_DISTRO"
+            cat "$SCRIPT_DIR/sources.conf" "$SCRIPT_DIR/build.sh" \
+                "$SCRIPT_DIR/xwayland.patch" "$ROOT/producers/common/fedora-latest-srpm.sh" \
+                "$ROOT/producers/denial/Arch_v5/build.sh"
+        } | sha256sum
+    ) || die 'Fedora input identity'
     FEDORA_INPUT_ID=${FEDORA_INPUT_ID%% *}
     build_deps=(gcc gcc-c++ cmake meson ninja-build pkgconf-pkg-config ccache python3 \
         curl ca-certificates git-core rpm-build rpmdevtools dnf5-plugins cpio patch tar xz unzip zip \
@@ -285,8 +273,10 @@ package_all() {
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     case ${1:-} in -h|--help) sed -n '2,4p' "$0"; exit 0 ;; esac
     HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
-    export ANLAND_DENIAL_RECIPE_DIR="$HERE" ANLAND_DENIAL_DISTRO=fedora44
-    export WORKDIR=${WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/denial-anland-fedora44}
+    FEDORA_RELEASE=${HERE##*/Fedora}
+    FEDORA_RELEASE=${FEDORA_RELEASE%_v5}
+    export ANLAND_DENIAL_RECIPE_DIR="$HERE" ANLAND_DENIAL_DISTRO="fedora$FEDORA_RELEASE"
+    export WORKDIR=${WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/denial-anland-fedora${FEDORA_RELEASE}}
     export ARTIFACTS_DIR=${ARTIFACTS_DIR:-$HERE/artifacts}
     exec bash "$HERE/../Arch_v5/build.sh" "$@"
 fi

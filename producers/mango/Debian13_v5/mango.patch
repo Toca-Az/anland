@@ -10,18 +10,17 @@ This is not the original author's unmodified commit patch.
 
  assets/mango-anland.desktop             |  8 ++++
  assets/mango-anland.service             | 35 ++++++++++++++
- include/mango/ext-protocol/text-input.h |  3 ++
- include/mango/layout/horizontal.h       |  1 +
- include/mango/layout/vertical.h         |  1 +
- meson.build                             | 29 ++++++++----
+ include/mango/ext-protocol/text-input.h |  4 ++
+ meson.build                             | 31 ++++++++----
  meson_options.txt                       |  1 +
  scripts/anland-volume.sh                | 75 ++++++++++++++++++++++++++++++
  scripts/mango-anland                    | 82 +++++++++++++++++++++++++++++++++
- src/ext-protocol/text-input.c           | 51 ++++++++++++++++++--
- src/input/touch.c                       | 38 +++++++++++++--
+ src/ext-protocol/text-input.c           | 95 ++++++++++++++++++++++++++++---
+ src/input/touch.c                       | 55 +++++++++++++++++---
  src/main.c                              | 50 ++++++++++++++------
  src/manage/monitor.c                    | 12 ++++-
- 13 files changed, 353 insertions(+), 33 deletions(-)
+ src/input/tablet.c                      | 13 ++++-
+ 12 files changed, 425 insertions(+), 36 deletions(-)
 
 diff --git a/assets/mango-anland.desktop b/assets/mango-anland.desktop
 new file mode 100644
@@ -108,7 +107,7 @@ index 4d9ec2e3..ff9c728c 100644
  
  /* ------------------ Protocol internal code ------------------------------ */
 diff --git a/meson.build b/meson.build
-index 5f6c7764..d0d9ceeb 100644
+index 5f6c7764..0a064c88 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -15,15 +15,7 @@ endif
@@ -128,25 +127,26 @@ index 5f6c7764..d0d9ceeb 100644
  cc = meson.get_compiler('c')
  libm = cc.find_library('m')
  libdrm = dependency('libdrm')
-@@ -40,6 +32,7 @@ libscenefx_dep = dependency('scenefx-0.5',version: '>=0.5.0')
+@@ -37,6 +29,7 @@ libinput_dep = dependency('libinput',version: '>=1.27.1')
+ libwayland_client_dep = dependency('wayland-client')
+ pcre2_dep = dependency('libpcre2-8')
+ libscenefx_dep = dependency('scenefx-0.5',version: '>=0.5.0')
++anland_dep = dependency('display-producer', required : get_option('anland'))
  pixman_dep = dependency('pixman-1')
  cjson_dep = dependency('libcjson')
  pangocairo_dep = dependency('pangocairo')
-+anland_dep = dependency('display-producer', required : get_option('anland'))
+@@ -91,6 +84,10 @@ if xcb.found() and xlibs.found()
+   c_args += '-DXWAYLAND'
+ endif
  
- # version info
- git = find_program('git', required : false)
-@@ -77,6 +70,9 @@ c_args = [
-   '-DVERSION="@0@"'.format(version_with_hash),
-   '-DSYSCONFDIR="@0@"'.format('/etc'),
- ]
 +if anland_dep.found()
 +  c_args += '-DHAVE_ANLAND'
 +endif
- 
- # add debug args only when debug option is enabled
++
+ # define link args
+ link_args = []
  if get_option('asan')
-@@ -102,6 +98,12 @@ endif
+@@ -102,6 +99,12 @@ endif
  # NOTE: mmsg/mmsg.c lives outside src/ on purpose (separate binary, own main()).
  find = find_program('find')
  mango_sources = files(run_command(find, 'src', '-name', '*.c', check: true).stdout().split())
@@ -159,23 +159,23 @@ index 5f6c7764..d0d9ceeb 100644
  
  mango_inc = include_directories('.', 'include')
  
-@@ -126,6 +128,7 @@ executable('mango',
+@@ -123,6 +126,7 @@ executable('mango',
+     libinput_dep,
+     libwayland_client_dep,
+     pcre2_dep,
++    anland_dep,
      pixman_dep,
      cjson_dep,
      pangocairo_dep,
-+    anland_dep,
-   ],
-   install : true,
-   c_args : c_args,
-@@ -177,6 +180,7 @@ mandir = get_option('mandir')
+@@ -176,6 +180,7 @@ executable('mmsg',
+ mandir = get_option('mandir')
  desktop_install_dir = join_paths(prefix, 'share/wayland-sessions')
  portal_install_dir = join_paths(prefix, 'share/xdg-desktop-portal')
- install_data('assets/mango.desktop', install_dir : desktop_install_dir)
 +install_data('assets/mango-anland.desktop', install_dir : desktop_install_dir)
+ install_data('assets/mango.desktop', install_dir : desktop_install_dir)
  install_data('assets/mango-portals.conf', install_dir : portal_install_dir)
  install_data('assets/config.conf', install_dir : join_paths(sysconfdir, 'mango'))
- 
-@@ -186,6 +190,14 @@ install_data('assets/config.conf', install_dir : join_paths(sysconfdir, 'mango')
+@@ -186,6 +191,14 @@ install_data('assets/config.conf', install_dir : join_paths(sysconfdir, 'mango')
  # set_activation_env() in src/main.c
  install_data('assets/mango-session.target',
    install_dir : join_paths(prefix, 'lib/systemd/user'))
