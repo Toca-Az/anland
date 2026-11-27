@@ -127,6 +127,7 @@ struct cam {
     uint32_t              negotiated_fmt;
     uint64_t              seq;
     struct spa_source    *stop_timer;
+    struct spa_source    *frame_timer;
 };
 
 struct anland_camera {
@@ -163,6 +164,15 @@ static void on_stop_timer(void *data, uint64_t expirations)
         LOG_CAM("anland-camera: STOP_RECORD cam=%d (auto-sleep after 3s inactivity)\n", cam->index);
         cam->recording = false;
         cam->have_frame = false;
+    }
+}
+
+static void on_frame_timer(void *data, uint64_t expirations)
+{
+    (void)expirations;
+    struct cam *cam = data;
+    if (cam->streaming && !cam->have_frame && cam->node) {
+        pw_stream_trigger_process(cam->node);
     }
 }
 
@@ -258,6 +268,9 @@ static void update_recording(struct cam *cam)
             send_ctrl(cam->owner, CAMERA_CTRL_START_RECORD, p, sizeof(p));
             LOG_CAM("anland-camera: START_RECORD cam=%d %ux%u (wake up)\n",
                     cam->index, cam->fmt_w, cam->fmt_h);
+            /* Reset slots on wake up so consumer reader thread is never blocked */
+            send_stream(cam, CAM_STREAM_DONE, 0);
+            send_stream(cam, CAM_STREAM_DONE, 1);
             request_shm(cam);
             cam->recording = true;
         }
@@ -275,8 +288,31 @@ static void update_recording(struct cam *cam)
 
 /* ---- frame emission ---- */
 
+static void fill_black_frame(uint8_t *dst, uint32_t w, uint32_t h, uint32_t fmt, size_t maxsize)
+{
+    uint32_t y_size = w * h;
+    if (fmt == SPA_VIDEO_FORMAT_YUY2) {
+        size_t sz = y_size * 2;
+        if (sz > maxsize) sz = maxsize;
+        for (size_t i = 0; i + 3 < sz; i += 4) {
+            dst[i + 0] = 16;  // Y0
+            dst[i + 1] = 128; // U
+            dst[i + 2] = 16;  // Y1
+            dst[i + 3] = 128; // V
+        }
+    } else {
+        // NV12 / NV21 / I420
+        size_t sz = y_size * 3 / 2;
+        if (sz > maxsize) sz = maxsize;
+        memset(dst, 16, y_size > sz ? sz : y_size);
+        if (sz > y_size) {
+            memset(dst + y_size, 128, sz - y_size);
+        }
+    }
+}
+
 /* The graph calls this whenever the consuming app needs a frame. Emit the latest
- * received frame, or neutral gray while detached / before the first frame arrives, so
+ * received frame, or clean black while detached / before the first frame arrives, so
  * a consuming app always gets a feed. Runs on the loop thread, same as the stream-
  * socket reader, so cam->frame needs no lock. */
 static void on_process(void *data)
@@ -322,7 +358,7 @@ static void on_process(void *data)
                     }
                 }
             } else {
-                memset(d->data, 128, out_size);
+                fill_black_frame((uint8_t *)d->data, w, h, cam->negotiated_fmt, d->maxsize);
             }
         } else if (cam->negotiated_fmt == SPA_VIDEO_FORMAT_NV12) {
             stride = w;
@@ -337,7 +373,7 @@ static void on_process(void *data)
                     dst_uv[i + 1] = src_vu[i];     // V
                 }
             } else {
-                memset(d->data, 128, out_size);
+                fill_black_frame((uint8_t *)d->data, w, h, cam->negotiated_fmt, d->maxsize);
             }
         } else if (cam->negotiated_fmt == SPA_VIDEO_FORMAT_I420) {
             stride = w;
@@ -353,7 +389,7 @@ static void on_process(void *data)
                     dst_u[i] = src_vu[2 * i + 1]; // U
                 }
             } else {
-                memset(d->data, 128, out_size);
+                fill_black_frame((uint8_t *)d->data, w, h, cam->negotiated_fmt, d->maxsize);
             }
         } else {
             out_size = y_size * 3 / 2;
@@ -361,7 +397,7 @@ static void on_process(void *data)
             if (live && cam->frame_size >= out_size)
                 memcpy(d->data, cam->frame, out_size);
             else
-                memset(d->data, 128, out_size);
+                fill_black_frame((uint8_t *)d->data, w, h, cam->negotiated_fmt, d->maxsize);
         }
 
         d->chunk->offset = 0;
@@ -487,9 +523,15 @@ static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, i
                 cam->frame_size = bytes;
                 cam->frame_w = w;
                 cam->frame_h = h;
-                if (!cam->have_frame)
+                if (!cam->have_frame) {
                     LOG_CAM("anland-camera: cam=%d first frame %ux%u (%zu bytes, slot=%u)\n",
                             cam->index, w, h, bytes, slot);
+                    if (cam->frame_timer && cam->owner && cam->owner->loop) {
+                        struct pw_loop *loop = pw_thread_loop_get_loop(cam->owner->loop);
+                        struct timespec disarm = { 0, 0 };
+                        pw_loop_update_timer(loop, cam->frame_timer, &disarm, NULL, false);
+                    }
+                }
                 cam->have_frame = true;
             }
         }
@@ -633,8 +675,24 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
     cam->streaming = streaming;
     update_recording(cam);
 
-    if (streaming && cam->have_frame && cam->node) {
-        pw_stream_trigger_process(cam->node);
+    struct pw_loop *loop = cam->owner && cam->owner->loop ? pw_thread_loop_get_loop(cam->owner->loop) : NULL;
+    if (streaming) {
+        if (!cam->frame_timer && loop) {
+            cam->frame_timer = pw_loop_add_timer(loop, on_frame_timer, cam);
+        }
+        if (cam->frame_timer && loop && !cam->have_frame) {
+            struct timespec value = { 0, 1000000 };     /* first tick in 1ms */
+            struct timespec interval = { 0, 33333333 }; /* 30 fps */
+            pw_loop_update_timer(loop, cam->frame_timer, &value, &interval, false);
+        }
+        if (cam->node) {
+            pw_stream_trigger_process(cam->node);
+        }
+    } else {
+        if (cam->frame_timer && loop) {
+            struct timespec value = { 0, 0 };
+            pw_loop_update_timer(loop, cam->frame_timer, &value, NULL, false);
+        }
     }
 }
 
@@ -792,6 +850,10 @@ static void destroy_node(struct cam *cam)
     if (cam->stop_timer && loop) {
         pw_loop_destroy_source(loop, cam->stop_timer);
         cam->stop_timer = NULL;
+    }
+    if (cam->frame_timer && loop) {
+        pw_loop_destroy_source(loop, cam->frame_timer);
+        cam->frame_timer = NULL;
     }
     if (cam->recording && cam->owner && cam->owner->ctrl_fd >= 0) {
         uint8_t id = (uint8_t)cam->index;
