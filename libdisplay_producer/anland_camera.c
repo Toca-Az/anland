@@ -126,6 +126,7 @@ struct cam {
     bool                  have_frame;
     uint32_t              negotiated_fmt;
     uint64_t              seq;
+    struct spa_source    *stop_timer;
 };
 
 struct anland_camera {
@@ -151,6 +152,19 @@ static void attach_fd(struct cam *cam, int fd);
 static void detach_fd(struct cam *cam);
 
 static void send_ctrl(struct anland_camera *c, uint8_t type, const uint8_t *payload, uint16_t len);
+
+static void on_stop_timer(void *data, uint64_t expirations)
+{
+    (void)expirations;
+    struct cam *cam = data;
+    if (!cam->streaming && cam->recording && cam->owner && cam->owner->ctrl_fd >= 0) {
+        uint8_t id = (uint8_t)cam->index;
+        send_ctrl(cam->owner, CAMERA_CTRL_STOP_RECORD, &id, 1);
+        LOG_CAM("anland-camera: STOP_RECORD cam=%d (auto-sleep after 3s inactivity)\n", cam->index);
+        cam->recording = false;
+        cam->have_frame = false;
+    }
+}
 
 static const struct spa_pod *build_video_format_spa(struct spa_pod_builder *b,
                                                     uint32_t w, uint32_t h, uint32_t spa_fmt)
@@ -225,11 +239,16 @@ static void request_shm(struct cam *cam)
  * socket + stream fd. Requests the consumer at the node's current format. */
 static void update_recording(struct cam *cam)
 {
+    struct pw_loop *loop = cam->owner && cam->owner->loop ? pw_thread_loop_get_loop(cam->owner->loop) : NULL;
     const bool want = cam->streaming && cam->stream_fd >= 0 && cam->owner && cam->owner->ctrl_fd >= 0;
     LOG_CAM("anland-camera: update_recording cam=%d want=%d (streaming=%d sfd=%d cfd=%d rec=%d)\n",
             cam->index, want, cam->streaming, cam->stream_fd,
             (cam->owner ? cam->owner->ctrl_fd : -1), cam->recording);
     if (want) {
+        if (cam->stop_timer && loop) {
+            struct timespec value = { 0, 0 };
+            pw_loop_update_timer(loop, cam->stop_timer, &value, NULL, false);
+        }
         if (!cam->recording) {
             uint8_t p[5];
             uint16_t w = (uint16_t)cam->fmt_w, h = (uint16_t)cam->fmt_h;
@@ -237,10 +256,19 @@ static void update_recording(struct cam *cam)
             memcpy(p + 1, &w, sizeof(w));
             memcpy(p + 3, &h, sizeof(h));
             send_ctrl(cam->owner, CAMERA_CTRL_START_RECORD, p, sizeof(p));
-            LOG_CAM("anland-camera: START_RECORD cam=%d %ux%u\n",
+            LOG_CAM("anland-camera: START_RECORD cam=%d %ux%u (wake up)\n",
                     cam->index, cam->fmt_w, cam->fmt_h);
             request_shm(cam);
             cam->recording = true;
+        }
+    } else if (cam->recording && cam->owner && cam->owner->ctrl_fd >= 0) {
+        if (!cam->stop_timer && loop) {
+            cam->stop_timer = pw_loop_add_timer(loop, on_stop_timer, cam);
+        }
+        if (cam->stop_timer && loop) {
+            struct timespec value = { 3, 0 }; // 3 seconds debounce before auto-sleep
+            pw_loop_update_timer(loop, cam->stop_timer, &value, NULL, false);
+            LOG_CAM("anland-camera: arming 3s auto-sleep timer for cam=%d\n", cam->index);
         }
     }
 }
@@ -760,6 +788,10 @@ static void destroy_node(struct cam *cam)
     if (cam->io && loop) {
         pw_loop_destroy_source(loop, cam->io);
         cam->io = NULL;
+    }
+    if (cam->stop_timer && loop) {
+        pw_loop_destroy_source(loop, cam->stop_timer);
+        cam->stop_timer = NULL;
     }
     if (cam->recording && cam->owner && cam->owner->ctrl_fd >= 0) {
         uint8_t id = (uint8_t)cam->index;
