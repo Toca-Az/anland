@@ -22,7 +22,7 @@
  * playback stereo L,R, mic mono, both S16LE. */
 #define DEFAULT_RATE          48000
 #define DEFAULT_PLAY_CHANNELS 2
-#define DEFAULT_CAP_CHANNELS  1
+#define DEFAULT_CAP_CHANNELS  2
 /* ~1s of stereo S16 mic audio; bounds added latency, old samples drop on overflow.
  * Sized for the worst case (stereo) so the ring never under-allocates. */
 #define MIC_RING_BYTES        (48000 * 2 * (int)sizeof(int16_t))
@@ -42,6 +42,9 @@ struct anland_audio {
     struct spa_hook        capture_listener;
     struct pw_stream      *source;    /* virtual Audio/Source <- socket (capture) */
     struct spa_hook        source_listener;
+    bool                   mic_streaming;
+    bool                   mic_recording;
+    uint32_t               android_cap_channels;
 
     /* Negotiated formats (the consumer owns the hardware and dictates these via
      * AUDIO_MSG_FORMAT). Defaults stand until the consumer's formats arrive. */
@@ -116,6 +119,7 @@ static void detach_audio_fd_locked(struct anland_audio *a)
 {
     struct spa_source *io = a->io;
     a->io = NULL;
+    a->mic_recording = false;
     a->audio_fd = -1;
     ring_reset(a);
     if (io)
@@ -179,8 +183,45 @@ static const struct pw_stream_events capture_events = {
     .process = on_capture_process,
 };
 
+static void on_source_add_buffer(void *data, struct pw_buffer *b)
+{
+    struct anland_audio *a = data;
+    pw_stream_queue_buffer(a->source, b);
+}
+
+static void on_source_state_changed(void *data, enum pw_stream_state old,
+                                    enum pw_stream_state state, const char *error)
+{
+    struct anland_audio *a = data;
+    (void)old;
+    (void)error;
+    fprintf(stderr, "anland-audio: mic source state %s -> %s\n",
+            pw_stream_state_as_string(old), pw_stream_state_as_string(state));
+
+    if (state == PW_STREAM_STATE_STREAMING) {
+        a->mic_streaming = true;
+        if (!a->mic_recording && a->audio_fd >= 0) {
+            struct audio_msg h = { .type = AUDIO_MSG_MIC_START, .size = 0 };
+            send(a->audio_fd, &h, sizeof(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+            fprintf(stderr, "anland-audio: START_RECORD mic (state STREAMING)\n");
+            a->mic_recording = true;
+        }
+    } else if (state == PW_STREAM_STATE_PAUSED) {
+        a->mic_streaming = false;
+        if (a->mic_recording && a->audio_fd >= 0) {
+            struct audio_msg h = { .type = AUDIO_MSG_MIC_STOP, .size = 0 };
+            send(a->audio_fd, &h, sizeof(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+            fprintf(stderr, "anland-audio: STOP_RECORD mic (state PAUSED)\n");
+            a->mic_recording = false;
+        }
+        ring_reset(a);
+    }
+}
+
 static const struct pw_stream_events source_events = {
     PW_VERSION_STREAM_EVENTS,
+    .state_changed = on_source_state_changed,
+    .add_buffer = on_source_add_buffer,
     .process = on_source_process,
 };
 
@@ -206,8 +247,12 @@ static void apply_format(struct anland_audio *a, const struct audio_format *f)
 {
     const bool playback = (f->role == AUDIO_ROLE_PLAYBACK);
     const uint32_t rate = f->rate ? f->rate : DEFAULT_RATE;
-    const uint32_t channels = f->channels ? f->channels
-                                          : (playback ? DEFAULT_PLAY_CHANNELS : DEFAULT_CAP_CHANNELS);
+    uint32_t channels = f->channels ? f->channels
+                                    : (playback ? DEFAULT_PLAY_CHANNELS : DEFAULT_CAP_CHANNELS);
+    if (!playback) {
+        a->android_cap_channels = channels;
+        channels = DEFAULT_CAP_CHANNELS;
+    }
     /* Validate before changing live stream state or doing PCM stride math. */
     if ((f->role != AUDIO_ROLE_PLAYBACK && f->role != AUDIO_ROLE_CAPTURE) ||
         f->format != AUDIO_FORMAT_S16LE || rate < 8000 || rate > 384000 ||
@@ -289,7 +334,23 @@ static void on_audio_readable(void *data, int fd, uint32_t mask)
         if (h.type != AUDIO_MSG_PCM)
             continue;
         size_t size = h.size < avail ? h.size : avail;
-        ring_write(a, a->rx + sizeof(struct audio_msg), size);
+        if (a->cap_channels == 2 && a->android_cap_channels == 1) {
+            int16_t stereo_buf[1024];
+            const int16_t *mono_in = (const int16_t *)(a->rx + sizeof(struct audio_msg));
+            size_t mono_samples = size / sizeof(int16_t);
+            while (mono_samples > 0) {
+                size_t chunk = mono_samples > 512 ? 512 : mono_samples;
+                for (size_t i = 0; i < chunk; i++) {
+                    stereo_buf[2 * i] = mono_in[i];
+                    stereo_buf[2 * i + 1] = mono_in[i];
+                }
+                ring_write(a, (const uint8_t *)stereo_buf, chunk * 2 * sizeof(int16_t));
+                mono_in += chunk;
+                mono_samples -= chunk;
+            }
+        } else {
+            ring_write(a, a->rx + sizeof(struct audio_msg), size);
+        }
     }
 }
 
@@ -458,8 +519,12 @@ static void on_reconnect_timer(void *data, uint64_t expirations)
 
 /* ---- public API ---- */
 
+static int s_saved_audio_fd = -1;
+
 void anland_audio_set_fd(int audio_fd)
 {
+    s_saved_audio_fd = audio_fd;
+    fprintf(stderr, "anland-audio: audio_fd set to %d\n", audio_fd);
     struct anland_audio *a = g_audio;
     if (!a)
         return;
@@ -480,6 +545,12 @@ void anland_audio_set_fd(int audio_fd)
                                    SPA_IO_IN, true, on_audio_readable, a);
             if (a->io) {
                 a->audio_fd = owned_fd;
+                if (a->mic_streaming && !a->mic_recording) {
+                    struct audio_msg h = { .type = AUDIO_MSG_MIC_START, .size = 0 };
+                    send(a->audio_fd, &h, sizeof(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+                    fprintf(stderr, "anland-audio: START_RECORD mic (on late fd bind)\n");
+                    a->mic_recording = true;
+                }
             } else {
                 close(owned_fd);
             }
@@ -508,6 +579,7 @@ int anland_audio_start(void)
     a->ring = malloc(a->ring_size);
     if (!a->ring)
         goto fail;
+    a->android_cap_channels = 1;
 
     a->loop = pw_thread_loop_new("anland-audio", NULL);
     if (!a->loop)
@@ -538,6 +610,9 @@ int anland_audio_start(void)
     pw_thread_loop_unlock(a->loop);
 
     g_audio = a;
+    if (s_saved_audio_fd >= 0) {
+        anland_audio_set_fd(s_saved_audio_fd);
+    }
     return 0;
 
 fail:
