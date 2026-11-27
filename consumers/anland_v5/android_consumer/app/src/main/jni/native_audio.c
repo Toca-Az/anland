@@ -42,6 +42,7 @@
 struct audio_bridge {
     volatile bool running;
     volatile bool mic_enabled;
+    volatile bool mic_active;
 
     /* The live connection. Set by audio_set_ctx() from the render thread, read by
      * the audio threads -- same lightweight convention as the event thread's
@@ -536,6 +537,7 @@ static void *play_thread_func(void *arg)
             pthread_mutex_unlock(&b->play_lock);
             had_fd = false;
             last_fd = fd;
+            b->mic_active = false;
         }
 
         if (fd < 0) {
@@ -568,6 +570,7 @@ static void *play_thread_func(void *arg)
             pthread_mutex_unlock(&b->play_lock);
             had_fd = false;
             last_fd = -1;
+            b->mic_active = false;
             usleep(20000);
             continue;
         }
@@ -581,6 +584,16 @@ static void *play_thread_func(void *arg)
 
         struct audio_msg h;
         memcpy(&h, b->rx, sizeof(h));
+        if (h.type == AUDIO_MSG_MIC_START) {
+            LOGI("mic remote active: START (wake up mic)");
+            b->mic_active = true;
+            continue;
+        }
+        if (h.type == AUDIO_MSG_MIC_STOP) {
+            LOGI("mic remote idle: STOP (sleep mic)");
+            b->mic_active = false;
+            continue;
+        }
         if (h.type != AUDIO_MSG_PCM)
             continue;   /* the producer only sends PCM back; formats flow upstream */
 
@@ -627,10 +640,11 @@ static void *cap_thread_func(void *arg)
 
     while (b->running) {
         int fd = current_fd(b);
-        if (!b->mic_enabled || fd < 0) {
+        if (!b->mic_enabled || !b->mic_active || fd < 0) {
             if (started && b->rec) {
                 AAudioStream_requestStop(b->rec);
                 started = false;
+                LOGI("mic capture sleeping (AAudioStream_requestStop, yellow dot off)");
             }
             usleep(20000);
             continue;
@@ -645,6 +659,7 @@ static void *cap_thread_func(void *arg)
                 continue;
             }
             started = true;
+            LOGI("mic capture active (AAudioStream_requestStart, yellow dot on)");
         }
 
         TracyCZoneN(zMicRead, "mic read", 1);
@@ -760,6 +775,8 @@ void audio_set_mic_enabled(audio_bridge *b, int enabled)
     if (!b)
         return;
     b->mic_enabled = enabled != 0;
+    if (!b->mic_enabled)
+        b->mic_active = false;
     LOGI("mic %s", b->mic_enabled ? "enabled" : "disabled");
 }
 
