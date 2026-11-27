@@ -1,3 +1,9 @@
+#define LOG_CAM(...) do { \
+    FILE *_f = fopen("/tmp/anland_camera.log", "a"); \
+    if (_f) { fprintf(_f, __VA_ARGS__); fclose(_f); } \
+    fprintf(stderr, __VA_ARGS__); \
+} while (0)
+
 #define _GNU_SOURCE
 #include "anland_camera.h"
 #include "protocol.h"
@@ -20,6 +26,7 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/param/buffers.h>
+#include <spa/buffer/meta.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/hook.h>
 
@@ -115,7 +122,10 @@ struct cam {
     uint8_t              *frame;
     size_t                frame_cap;
     size_t                frame_size;
+    uint32_t              frame_w, frame_h;
     bool                  have_frame;
+    uint32_t              negotiated_fmt;
+    uint64_t              seq;
 };
 
 struct anland_camera {
@@ -139,6 +149,37 @@ static void create_nodes(struct anland_camera *c);
 static void destroy_nodes(struct anland_camera *c);
 static void attach_fd(struct cam *cam, int fd);
 static void detach_fd(struct cam *cam);
+
+static void send_ctrl(struct anland_camera *c, uint8_t type, const uint8_t *payload, uint16_t len);
+
+static const struct spa_pod *build_video_format_spa(struct spa_pod_builder *b,
+                                                    uint32_t w, uint32_t h, uint32_t spa_fmt)
+{
+    struct spa_video_info_raw info;
+    spa_zero(info);
+    info.format = spa_fmt;
+    info.size = SPA_RECTANGLE(w, h);
+    info.framerate = SPA_FRACTION(CAM_FPS, 1);
+    return spa_format_video_raw_build(b, SPA_PARAM_EnumFormat, &info);
+}
+
+static int build_video_formats(struct spa_pod_builder *b, const struct spa_pod **params,
+                                uint32_t w, uint32_t h)
+{
+    // Clamp to standard 720p HD webcam resolution (1280x720).
+    uint32_t use_w = CAM_DEF_W; // 1280
+    uint32_t use_h = CAM_DEF_H; // 720
+    if (w == 1920 && h == 1080) {
+        use_w = 1920;
+        use_h = 1080;
+    }
+    params[0] = build_video_format_spa(b, use_w, use_h, SPA_VIDEO_FORMAT_NV12);
+    params[1] = build_video_format_spa(b, use_w, use_h, SPA_VIDEO_FORMAT_I420);
+    params[2] = build_video_format_spa(b, use_w, use_h, SPA_VIDEO_FORMAT_YUY2);
+    params[3] = build_video_format_spa(b, use_w, use_h, SPA_VIDEO_FORMAT_NV21);
+    return 4;
+}
+
 static const struct spa_pod *build_video_format(struct spa_pod_builder *b,
                                                 uint32_t w, uint32_t h, int fmt_code);
 
@@ -184,25 +225,24 @@ static void request_shm(struct cam *cam)
  * socket + stream fd. Requests the consumer at the node's current format. */
 static void update_recording(struct cam *cam)
 {
-    const bool want = cam->streaming && cam->stream_fd >= 0 && cam->owner->ctrl_fd >= 0;
-    if (want == cam->recording)
-        return;
+    const bool want = cam->streaming && cam->stream_fd >= 0 && cam->owner && cam->owner->ctrl_fd >= 0;
+    LOG_CAM("anland-camera: update_recording cam=%d want=%d (streaming=%d sfd=%d cfd=%d rec=%d)\n",
+            cam->index, want, cam->streaming, cam->stream_fd,
+            (cam->owner ? cam->owner->ctrl_fd : -1), cam->recording);
     if (want) {
-        uint8_t p[5];
-        uint16_t w = (uint16_t)cam->fmt_w, h = (uint16_t)cam->fmt_h;
-        p[0] = (uint8_t)cam->index;
-        memcpy(p + 1, &w, sizeof(w));
-        memcpy(p + 3, &h, sizeof(h));
-        send_ctrl(cam->owner, CAMERA_CTRL_START_RECORD, p, sizeof(p));
-        fprintf(stderr, "anland-camera: START_RECORD cam=%d %ux%u\n",
-                cam->index, cam->fmt_w, cam->fmt_h);
-        request_shm(cam);   /* pull the shm fd so frames can flow */
-    } else if (cam->owner->ctrl_fd >= 0) {
-        uint8_t id = (uint8_t)cam->index;
-        send_ctrl(cam->owner, CAMERA_CTRL_STOP_RECORD, &id, 1);
-        fprintf(stderr, "anland-camera: STOP_RECORD cam=%d\n", cam->index);
+        if (!cam->recording) {
+            uint8_t p[5];
+            uint16_t w = (uint16_t)cam->fmt_w, h = (uint16_t)cam->fmt_h;
+            p[0] = (uint8_t)cam->index;
+            memcpy(p + 1, &w, sizeof(w));
+            memcpy(p + 3, &h, sizeof(h));
+            send_ctrl(cam->owner, CAMERA_CTRL_START_RECORD, p, sizeof(p));
+            LOG_CAM("anland-camera: START_RECORD cam=%d %ux%u\n",
+                    cam->index, cam->fmt_w, cam->fmt_h);
+            request_shm(cam);
+            cam->recording = true;
+        }
     }
-    cam->recording = want;
 }
 
 /* ---- frame emission ---- */
@@ -219,25 +259,96 @@ static void on_process(void *data)
 
     struct pw_buffer *pwb = pw_stream_dequeue_buffer(cam->node);
     if (!cam->process_seen) {
-        fprintf(stderr, "anland-camera: cam=%d on_process called, buffer=%s\n",
-                cam->index, pwb ? "ok" : "NULL(out of buffers)");
+        LOG_CAM("anland-camera: cam=%d on_process called, buffer=%s, fmt=%u\n",
+                cam->index, pwb ? "ok" : "NULL(out of buffers)", cam->negotiated_fmt);
         cam->process_seen = true;
     }
     if (!pwb)
         return;
     struct spa_data *d = &pwb->buffer->datas[0];
-    if (d->data) {
-        const bool live = cam->have_frame && cam->stream_fd >= 0;
-        uint32_t fmt_bytes = cam->fmt_w * cam->fmt_h * 3 / 2;
-        uint32_t avail = live ? (uint32_t)cam->frame_size : fmt_bytes;
-        uint32_t copy = avail < d->maxsize ? avail : d->maxsize;
-        if (live)
-            memcpy(d->data, cam->frame, copy);
-        else
-            memset(d->data, 128, copy);   /* neutral gray: valid I420 at any size */
+    if (d && d->data) {
+        const bool live = cam->have_frame && cam->stream_fd >= 0 && cam->frame != NULL;
+        uint32_t w = cam->fmt_w;
+        uint32_t h = cam->fmt_h;
+        uint32_t y_size = w * h;
+        uint32_t out_size = y_size * 3 / 2;
+        uint32_t stride = w;
+
+        if (cam->negotiated_fmt == SPA_VIDEO_FORMAT_YUY2) {
+            stride = w * 2;
+            out_size = y_size * 2;
+            if (out_size > d->maxsize) out_size = d->maxsize;
+            if (live && cam->frame_size >= y_size * 3 / 2) {
+                const uint8_t *src_y = cam->frame;
+                const uint8_t *src_vu = cam->frame + y_size;
+                uint8_t *dst = (uint8_t *)d->data;
+                for (uint32_t r = 0; r < h; r++) {
+                    const uint8_t *yr = src_y + r * w;
+                    const uint8_t *vur = src_vu + (r / 2) * w;
+                    uint8_t *dr = dst + r * (w * 2);
+                    for (uint32_t c = 0; c < w; c += 2) {
+                        dr[2*c + 0] = yr[c + 0];
+                        dr[2*c + 1] = vur[c + 1]; // U
+                        dr[2*c + 2] = yr[c + 1];
+                        dr[2*c + 3] = vur[c + 0]; // V
+                    }
+                }
+            } else {
+                memset(d->data, 128, out_size);
+            }
+        } else if (cam->negotiated_fmt == SPA_VIDEO_FORMAT_NV12) {
+            stride = w;
+            out_size = y_size * 3 / 2;
+            if (out_size > d->maxsize) out_size = d->maxsize;
+            if (live && cam->frame_size >= y_size * 3 / 2) {
+                memcpy(d->data, cam->frame, y_size);
+                const uint8_t *src_vu = cam->frame + y_size;
+                uint8_t *dst_uv = (uint8_t *)d->data + y_size;
+                for (size_t i = 0; i < y_size / 2; i += 2) {
+                    dst_uv[i]     = src_vu[i + 1]; // U
+                    dst_uv[i + 1] = src_vu[i];     // V
+                }
+            } else {
+                memset(d->data, 128, out_size);
+            }
+        } else if (cam->negotiated_fmt == SPA_VIDEO_FORMAT_I420) {
+            stride = w;
+            out_size = y_size * 3 / 2;
+            if (out_size > d->maxsize) out_size = d->maxsize;
+            if (live && cam->frame_size >= y_size * 3 / 2) {
+                memcpy(d->data, cam->frame, y_size);
+                uint8_t *dst_u = (uint8_t *)d->data + y_size;
+                uint8_t *dst_v = (uint8_t *)d->data + y_size + y_size / 4;
+                const uint8_t *src_vu = cam->frame + y_size;
+                for (size_t i = 0; i < y_size / 4; i++) {
+                    dst_v[i] = src_vu[2 * i];     // V
+                    dst_u[i] = src_vu[2 * i + 1]; // U
+                }
+            } else {
+                memset(d->data, 128, out_size);
+            }
+        } else {
+            out_size = y_size * 3 / 2;
+            if (out_size > d->maxsize) out_size = d->maxsize;
+            if (live && cam->frame_size >= out_size)
+                memcpy(d->data, cam->frame, out_size);
+            else
+                memset(d->data, 128, out_size);
+        }
+
         d->chunk->offset = 0;
-        d->chunk->stride = cam->fmt_w;   /* I420 Y-plane stride */
-        d->chunk->size = copy;
+        d->chunk->stride = stride;
+        d->chunk->size = out_size;
+
+        struct spa_meta_header *hdr = spa_buffer_find_meta_data(pwb->buffer, SPA_META_Header, sizeof(*hdr));
+        if (hdr) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            hdr->pts = (int64_t)SPA_TIMESPEC_TO_NSEC(&now);
+            hdr->flags = 0;
+            hdr->seq = cam->seq++;
+            hdr->dts_offset = 0;
+        }
     }
     pw_stream_queue_buffer(cam->node, pwb);
 }
@@ -250,7 +361,7 @@ static void renegotiate_format(struct cam *cam, uint32_t w, uint32_t h, int fmt_
 {
     if (!cam->node || !valid_frame_size(w, h))
         return;
-    fprintf(stderr, "anland-camera: cam=%d renegotiate %ux%u/fmt%d -> %ux%u/fmt%d\n",
+    LOG_CAM("anland-camera: cam=%d renegotiate %ux%u/fmt%d -> %ux%u/fmt%d\n",
             cam->index, cam->fmt_w, cam->fmt_h, cam->fmt_code, w, h, fmt_code);
     cam->fmt_w = w;
     cam->fmt_h = h;
@@ -279,6 +390,8 @@ static void unmap_shm(struct cam *cam)
 
 static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, int rfd)
 {
+    LOG_CAM("anland-camera: handle_stream_msg cam=%d type=%u slot=%u a=%u b=%u fmt=%d rfd=%d\n",
+            cam->index, m->type, m->slot, m->a, m->b, m->fmt, rfd);
     switch (m->type) {
     case CAM_STREAM_SHM_OFFER: {
         if (rfd < 0)
@@ -313,7 +426,7 @@ static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, i
             cam->shm_bytes = cam->slot_bytes = 0;
             return;
         }
-        fprintf(stderr, "anland-camera: cam=%d shm mapped %zu B/slot\n",
+        LOG_CAM("anland-camera: cam=%d shm mapped %zu B/slot\n",
                 cam->index, slot_bytes);
         break;
     }
@@ -344,16 +457,21 @@ static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, i
                 /* Copy out of the slot promptly so the consumer can reuse it. */
                 memcpy(cam->frame, cam->shm + (size_t)slot * cam->slot_bytes, bytes);
                 cam->frame_size = bytes;
+                cam->frame_w = w;
+                cam->frame_h = h;
                 if (!cam->have_frame)
-                    fprintf(stderr, "anland-camera: cam=%d first frame %ux%u\n",
-                            cam->index, w, h);
+                    LOG_CAM("anland-camera: cam=%d first frame %ux%u (%zu bytes, slot=%u)\n",
+                            cam->index, w, h, bytes, slot);
                 cam->have_frame = true;
             }
         }
         /* Release the slot (even if we couldn't read, so the consumer never wedges). */
         send_stream(cam, CAM_STREAM_DONE, slot);
-        if (w && h && (w != cam->fmt_w || h != cam->fmt_h || fmt != cam->fmt_code))
-            renegotiate_format(cam, w, h, fmt);
+
+        /* Trigger next graph cycle so PipeWire pumps this frame to Chrome/apps */
+        if (cam->streaming && cam->node) {
+            pw_stream_trigger_process(cam->node);
+        }
         break;
     }
     default:
@@ -439,6 +557,7 @@ static void attach_fd(struct cam *cam, int fd)
     unmap_shm(cam);                   /* re-requested on the new connection */
     cam->have_frame = false;          /* show blank until a fresh frame arrives */
     cam->frame_size = 0;
+    cam->recording = false;           /* reset recording state for new descriptor */
     if (fd >= 0)
         cam->io = pw_loop_add_io(loop, fd, SPA_IO_IN, false, on_stream_readable, cam);
     update_recording(cam);            /* START + GET_SHM if an app is consuming */
@@ -447,6 +566,7 @@ static void attach_fd(struct cam *cam, int fd)
 
 static void detach_fd(struct cam *cam)
 {
+    cam->recording = false;
     attach_fd(cam, -1);
 }
 
@@ -477,13 +597,17 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
 {
     struct cam *cam = data;
     (void)error;
-    fprintf(stderr, "anland-camera: cam=%d state %s -> %s\n", cam->index,
+    LOG_CAM("anland-camera: cam=%d state %s -> %s\n", cam->index,
             pw_stream_state_as_string(old), pw_stream_state_as_string(state));
     const bool streaming = (state == PW_STREAM_STATE_STREAMING);
     if (streaming == cam->streaming)
         return;
     cam->streaming = streaming;
     update_recording(cam);
+
+    if (streaming && cam->have_frame && cam->node) {
+        pw_stream_trigger_process(cam->node);
+    }
 }
 
 /* The format was negotiated: parse it and declare a buffer pool of the matching size.
@@ -508,22 +632,32 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     cam->fmt_w = raw.size.width;
     cam->fmt_h = raw.size.height;
 
+    cam->negotiated_fmt = raw.format;
     uint32_t frame_bytes = cam->fmt_w * cam->fmt_h * 3 / 2;
-    fprintf(stderr, "anland-camera: cam=%d format negotiated %ux%u (%ub), declaring buffers\n",
-            cam->index, cam->fmt_w, cam->fmt_h, frame_bytes);
+    uint32_t stride = cam->fmt_w;
+    if (raw.format == SPA_VIDEO_FORMAT_YUY2 || raw.format == SPA_VIDEO_FORMAT_UYVY) {
+        frame_bytes = cam->fmt_w * cam->fmt_h * 2;
+        stride = cam->fmt_w * 2;
+    }
+    LOG_CAM("anland-camera: cam=%d format negotiated fmt=%u %ux%u (%ub), declaring buffers\n",
+            cam->index, raw.format, cam->fmt_w, cam->fmt_h, frame_bytes);
 
-    uint8_t buffer[512];
+    uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod *params[1];
+    const struct spa_pod *params[2];
     params[0] = spa_pod_builder_add_object(&b,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_buffers,  SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
         SPA_PARAM_BUFFERS_blocks,   SPA_POD_Int(1),
         SPA_PARAM_BUFFERS_size,     SPA_POD_Int((int)frame_bytes),
-        SPA_PARAM_BUFFERS_stride,   SPA_POD_Int((int)cam->fmt_w),
+        SPA_PARAM_BUFFERS_stride,   SPA_POD_Int((int)stride),
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
             (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
-    pw_stream_update_params(cam->node, params, 1);
+    params[1] = spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+        SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+        SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
+    pw_stream_update_params(cam->node, params, 2);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -547,22 +681,26 @@ static int connect_node(struct cam *cam)
             PW_KEY_MEDIA_ROLE, "Camera",
             PW_KEY_NODE_NAME, name,
             PW_KEY_NODE_DESCRIPTION, desc,
-            NULL));
+                        NULL));
     if (!cam->node)
         return -1;
     pw_stream_add_listener(cam->node, &cam->listener, &stream_events, cam);
 
-    uint8_t buffer[1024];
+    cam->fmt_w = CAM_DEF_W;
+    cam->fmt_h = CAM_DEF_H;
+    cam->seq = 0;
+    uint8_t buffer[2048];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod *params[1] = {
-        build_video_format(&b, cam->fmt_w, cam->fmt_h, cam->fmt_code) };
+    const struct spa_pod *params[5];
+    int n_params = build_video_formats(&b, params, cam->fmt_w, cam->fmt_h);
+    params[n_params++] = spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+        SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+        SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
 
-    /* No DRIVER flag: the consuming app (graph) drives, so PipeWire calls on_process
-     * on demand. No RT_PROCESS either, so on_process runs on the same loop thread as
-     * the stream-socket reader and shares cam->frame without a lock. */
     return pw_stream_connect(cam->node, PW_DIRECTION_OUTPUT, PW_ID_ANY,
                              PW_STREAM_FLAG_MAP_BUFFERS,
-                             params, 1);
+                             params, n_params);
 }
 
 /* Create the node for one camera slot (no fd attached yet). PipeWire drives its
@@ -622,6 +760,11 @@ static void destroy_node(struct cam *cam)
     if (cam->io && loop) {
         pw_loop_destroy_source(loop, cam->io);
         cam->io = NULL;
+    }
+    if (cam->recording && cam->owner && cam->owner->ctrl_fd >= 0) {
+        uint8_t id = (uint8_t)cam->index;
+        send_ctrl(cam->owner, CAMERA_CTRL_STOP_RECORD, &id, 1);
+        LOG_CAM("anland-camera: destroy_node STOP_RECORD cam=%d\n", cam->index);
     }
     cam->streaming = false;
     cam->recording = false;
@@ -745,6 +888,10 @@ static int limit_camera_resources(const int *stream_fds, int num_cameras)
 
 void anland_camera_set_resources(int ctrl_fd, const int *stream_fds, int num_cameras)
 {
+    LOG_CAM("anland-camera: set_resources ctrl_fd=%d num_cameras=%d stream_fds=[%d, %d]\n",
+            ctrl_fd, num_cameras,
+            (num_cameras > 0 ? stream_fds[0] : -1),
+            (num_cameras > 1 ? stream_fds[1] : -1));
     /* Lazily bring the engine up on the first resource delivery: the PipeWire
      * thread-loop is only started once a consumer actually hands over a camera,
      * never just because the backend is running. */
@@ -784,6 +931,10 @@ void anland_camera_set_resources(int ctrl_fd, const int *stream_fds, int num_cam
         close(c->ctrl_fd);
     c->ctrl_fd = ctrl_fd;
 
+    for (int i = 0; i < MAX_CAMERAS; i++) {
+        c->cams[i].recording = false;
+    }
+
     /* Pop excess cameras if the new connection exposes fewer than before. */
     for (int i = num_cameras; i < c->num_cameras; i++) {
         destroy_node(&c->cams[i]);
@@ -802,9 +953,9 @@ void anland_camera_set_resources(int ctrl_fd, const int *stream_fds, int num_cam
          * must not touch fmt_w/h -- it would desync on_process's stride from the node's
          * live negotiated format. Use only bounded, even YUV dimensions;
          * an invalid/missing reply leaves create_node's 720p default in place. */
-        if (!cam->node && qw[i] >= 64 && qh[i] >= 64 && valid_frame_size(qw[i], qh[i])) {
-            cam->fmt_w = qw[i];
-            cam->fmt_h = qh[i];
+        if (!cam->node) {
+            cam->fmt_w = CAM_DEF_W;
+            cam->fmt_h = CAM_DEF_H;
         }
         create_node(cam);
         attach_fd(cam, stream_fds[i]);
