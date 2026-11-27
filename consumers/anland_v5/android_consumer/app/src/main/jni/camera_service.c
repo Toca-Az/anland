@@ -82,6 +82,9 @@ static struct camera_hw {
     ACameraDevice_StateCallbacks    dev_cb[MAX_CAMERAS];
     ACameraCaptureSession_stateCallbacks ses_cb[MAX_CAMERAS];
     int  rec_count[MAX_CAMERAS];   /* #clients recording cam; capture runs while >0 */
+    int  cur_w[MAX_CAMERAS];       /* currently configured width */
+    int  cur_h[MAX_CAMERAS];       /* currently configured height */
+    bool hot_standby[MAX_CAMERAS]; /* true when camera is in zero-power hot standby (stopRepeating) */
 
     /* Shared per-camera frame buffer + slot accounting. */
     int      shm_fd[MAX_CAMERAS];
@@ -371,15 +374,37 @@ static void on_session_active(void *context, ACameraCaptureSession *s) { (void)c
  * --------------------------------------------------------------- */
 
 static void cam_stop_locked(int id);
+static void cam_pause_locked(int id);
 
 static void cam_start_locked(int id, int width, int height)
 {
-    cam_stop_locked(id);   /* tear down any prior pipeline first */
+    /* If another camera is open/in-standby, close it to free Qualcomm ISP concurrent stream limits */
+    for (int other = 0; other < g_cam.num_cameras; other++) {
+        if (other != id && g_cam.device[other]) {
+            LOGI("start: closing other camera %d before opening %d", other, id);
+            cam_stop_locked(other);
+        }
+    }
 
     int w = (width  > 0) ? width  : g_cam.max_w[id];
     int h = (height > 0) ? height : g_cam.max_h[id];
     if (w <= 0) w = 1;
     if (h <= 0) h = 1;
+
+    /* Check if we can resume directly from Hot Standby (<1ms wake-up) */
+    if (g_cam.hot_standby[id] && g_cam.session[id] && g_cam.request[id] &&
+        g_cam.cur_w[id] == w && g_cam.cur_h[id] == h) {
+        camera_status_t cs = ACameraCaptureSession_setRepeatingRequest(
+                g_cam.session[id], NULL, 1, &g_cam.request[id], NULL);
+        if (cs == ACAMERA_OK) {
+            g_cam.hot_standby[id] = false;
+            LOGI("start: camera %d resumed from hot standby %dx%d (instant wake)", id, w, h);
+            return;
+        }
+        LOGE("start: camera %d hot standby resume failed: %d, falling back to full open", id, cs);
+    }
+
+    cam_stop_locked(id);   /* tear down any prior pipeline first */
 
     media_status_t ms = AImageReader_newWithUsage(
             w, h, AIMAGE_FORMAT_YUV_420_888,
@@ -452,13 +477,27 @@ static void cam_start_locked(int id, int width, int height)
         cam_stop_locked(id);
         return;
     }
+    g_cam.cur_w[id] = w;
+    g_cam.cur_h[id] = h;
+    g_cam.hot_standby[id] = false;
     LOGI("start: camera %d started %dx%d", id, w, h);
+}
+
+static void cam_pause_locked(int id)
+{
+    if (g_cam.session[id] && !g_cam.hot_standby[id]) {
+        ACameraCaptureSession_stopRepeating(g_cam.session[id]);
+        ACameraCaptureSession_abortCaptures(g_cam.session[id]);
+        g_cam.hot_standby[id] = true;
+        LOGI("pause: camera %d entered hot standby (stopRepeating, LED off, 0 power)", id);
+    }
 }
 
 static void cam_stop_locked(int id)
 {
     if (g_cam.session[id]) {
         ACameraCaptureSession_stopRepeating(g_cam.session[id]);
+        ACameraCaptureSession_abortCaptures(g_cam.session[id]);
         ACameraCaptureSession_close(g_cam.session[id]);
         g_cam.session[id] = NULL;
     }
@@ -467,11 +506,16 @@ static void cam_stop_locked(int id)
     if (g_cam.session_output[id]) { ACaptureSessionOutput_free(g_cam.session_output[id]); g_cam.session_output[id] = NULL; }
     if (g_cam.out_container[id]) { ACaptureSessionOutputContainer_free(g_cam.out_container[id]); g_cam.out_container[id] = NULL; }
     if (g_cam.reader[id]) {
+        /* Disarm listener first to prevent on_frame_available callback during teardown */
+        AImageReader_setImageListener(g_cam.reader[id], NULL);
         AImageReader_delete(g_cam.reader[id]);   /* invalidates its window */
         g_cam.reader[id] = NULL;
         g_cam.window[id] = NULL;
     }
     if (g_cam.device[id]) { ACameraDevice_close(g_cam.device[id]); g_cam.device[id] = NULL; }
+    g_cam.hot_standby[id] = false;
+    g_cam.cur_w[id] = 0;
+    g_cam.cur_h[id] = 0;
 }
 
 static void cam_start_recording(int id, int w, int h)
@@ -479,6 +523,14 @@ static void cam_start_recording(int id, int w, int h)
     if (id < 0 || id >= g_cam.num_cameras) return;
     pthread_mutex_lock(&g_cam.cap_lock[id]);
     cam_start_locked(id, w, h);
+    pthread_mutex_unlock(&g_cam.cap_lock[id]);
+}
+
+static void cam_pause_recording(int id)
+{
+    if (id < 0 || id >= g_cam.num_cameras) return;
+    pthread_mutex_lock(&g_cam.cap_lock[id]);
+    cam_pause_locked(id);
     pthread_mutex_unlock(&g_cam.cap_lock[id]);
 }
 
@@ -530,7 +582,7 @@ static void client_stop_record(struct camera_client *c, int cam)
     }
     pthread_mutex_unlock(&g_cam.clients_lock);
     if (last)
-        cam_stop_recording(cam);   /* list empty: release the physical camera */
+        cam_pause_recording(cam);   /* list empty: put camera in hot standby */
 }
 
 static void client_stop_all(struct camera_client *c)
