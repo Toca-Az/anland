@@ -161,7 +161,7 @@ static void on_stop_timer(void *data, uint64_t expirations)
     if (!cam->streaming && cam->recording && cam->owner && cam->owner->ctrl_fd >= 0) {
         uint8_t id = (uint8_t)cam->index;
         send_ctrl(cam->owner, CAMERA_CTRL_STOP_RECORD, &id, 1);
-        LOG_CAM("anland-camera: STOP_RECORD cam=%d (auto-sleep after 250ms inactivity)\n", cam->index);
+        LOG_CAM("anland-camera: STOP_RECORD cam=%d (auto-sleep after 100ms inactivity)\n", cam->index);
         cam->recording = false;
         cam->have_frame = false;
     }
@@ -279,9 +279,9 @@ static void update_recording(struct cam *cam)
             cam->stop_timer = pw_loop_add_timer(loop, on_stop_timer, cam);
         }
         if (cam->stop_timer && loop) {
-            struct timespec value = { 0, 250000000 }; // 250ms (0.25s) debounce for instant close
+            struct timespec value = { 0, 100000000 }; // 100ms (0.25s) debounce for instant close
             pw_loop_update_timer(loop, cam->stop_timer, &value, NULL, false);
-            LOG_CAM("anland-camera: arming 250ms auto-sleep timer for cam=%d\n", cam->index);
+            LOG_CAM("anland-camera: arming 100ms auto-sleep timer for cam=%d\n", cam->index);
         }
     }
 }
